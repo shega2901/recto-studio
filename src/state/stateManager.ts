@@ -44,6 +44,7 @@ import { parseCsv, generateMergedSpreads, substituteElementTokens } from '../dat
 import { KnuthPlassComposer, ComposerOptions } from '../engine/knuthPlass';
 import { psdEngine } from '../engine/psdParser';
 import { assetStore } from '../engine/assetStore';
+import { ensureParagraphs, syncTextElement } from '../utils/paragraphs';
 import { colorEngine, GamutAuditResult, IccProfileName } from '../engine/colorEngine';
 
 const SUPERSCRIPTS: Record<string, string> = {
@@ -871,6 +872,8 @@ export class StateManager {
       this.state.conditions = JSON.parse(JSON.stringify(DEFAULT_CONDITIONS));
     }
 
+    this.migrateTextParagraphs();
+
     // Heal older placeholder image frames if loaded from previous unmigrated local storage cache
     for (const spread of this.state.spreads) {
       for (const el of spread.elements) {
@@ -886,6 +889,16 @@ export class StateManager {
       }
     }
     this.pushHistory();
+  }
+
+  /** Gives every text frame (pages and masters) a `paragraphs` list; old projects only had `text`. */
+  private migrateTextParagraphs() {
+    const containers = [...(this.state.spreads || []), ...(this.state.masterSpreads || [])];
+    for (const container of containers) {
+      for (const el of container.elements || []) {
+        if (el.type === 'text') ensureParagraphs(el as TextElement);
+      }
+    }
   }
 
   public getState(): ProjectState {
@@ -1333,6 +1346,7 @@ export class StateManager {
       element.layerId = this.state.activeLayerId || 'layer-1';
     }
     const spread = this.getActiveSpread();
+    if (element.type === 'text') ensureParagraphs(element as TextElement);
     spread.elements.push(element);
     this.state.selectedElementId = element.id;
     this.state.selectedElementIds = [element.id];
@@ -1355,7 +1369,8 @@ export class StateManager {
       if (el.type === 'text') {
         const textEl = el as TextElement;
         const textUpdates = updates as Partial<TextElement>;
-        if (textUpdates.text !== undefined && !textEl.prevFrameId) {
+        syncTextElement(textEl, textUpdates);
+        if ((textUpdates.text !== undefined || textUpdates.paragraphs !== undefined) && !textEl.prevFrameId) {
           textEl.rawStoryText = textEl.text;
         }
         if (textEl.nextFrameId || textEl.prevFrameId) {
@@ -1383,7 +1398,8 @@ export class StateManager {
         if (el.type === 'text') {
           const textEl = el as TextElement;
           const textPartial = partial as Partial<TextElement>;
-          if (textPartial.text !== undefined && !textEl.prevFrameId) {
+          syncTextElement(textEl, textPartial);
+          if ((textPartial.text !== undefined || textPartial.paragraphs !== undefined) && !textEl.prevFrameId) {
             textEl.rawStoryText = textEl.text;
           }
           if (textEl.nextFrameId || textEl.prevFrameId) {
@@ -1746,6 +1762,7 @@ export class StateManager {
 
     if (chain.length === 1) {
       headFrame.text = fullStory;
+      ensureParagraphs(headFrame);
       return;
     }
 
@@ -1775,6 +1792,8 @@ export class StateManager {
         wordIdx += frameWordCapacity;
       }
     }
+
+    for (const frame of chain) ensureParagraphs(frame);
   }
 
   public linkTextFrames(sourceId: string, targetId: string): boolean {
@@ -2451,6 +2470,7 @@ export class StateManager {
 
   public resetToDefault() {
     this.state = JSON.parse(JSON.stringify(INITIAL_STATE));
+    this.migrateTextParagraphs();
     this.pushHistory();
     this.notify();
   }
@@ -2589,6 +2609,7 @@ export class StateManager {
           parsed.settings.iccProfile = 'FOGRA39';
         }
         this.state = parsed;
+        this.migrateTextParagraphs();
         this.renumberPages();
         this.pushHistory();
         this.notify();
@@ -2608,6 +2629,7 @@ export class StateManager {
         newState.activeLayerId = newState.layers[0]?.id || 'layer-1';
       }
       this.state = newState;
+      this.migrateTextParagraphs();
       this.renumberPages();
       this.pushHistory();
       this.notify();
@@ -2630,6 +2652,7 @@ export class StateManager {
         newState.activeLayerId = newState.layers[0]?.id || 'layer-1';
       }
       this.state = newState;
+      this.migrateTextParagraphs();
       this.renumberPages();
       this.pushHistory();
       this.notify();
@@ -3299,6 +3322,7 @@ export class StateManager {
     const snap = this.snapshots.find((s) => s.id === snapshotId);
     if (!snap) return false;
     this.state = JSON.parse(JSON.stringify(snap.state));
+    this.migrateTextParagraphs();
     this.pushHistory();
     this.notify();
     return true;

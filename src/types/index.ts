@@ -145,6 +145,16 @@ export interface ParagraphStyle {
   };
 }
 
+/** Per-paragraph local formatting that overrides the applied paragraph style (like InDesign's "+" overrides). */
+export type ParagraphOverrides = Partial<Omit<ParagraphStyle, 'id' | 'name'>>;
+
+export interface Paragraph {
+  text: string;
+  /** Applied paragraph style. When omitted the paragraph inherits TextElement.paragraphStyleId. */
+  styleId?: string;
+  overrides?: ParagraphOverrides;
+}
+
 export interface AnchoredObjectSettings {
   parentTextId: string;
   mode?: 'inline' | 'aboveLine';
@@ -253,7 +263,10 @@ export interface BaseElement {
 
 export interface TextElement extends BaseElement {
   type: 'text';
+  /** Plain text, paragraphs separated by '\n'. Mirror of `paragraphs`; use getPlainText/setPlainText from utils/paragraphs. */
   text: string;
+  /** Per-paragraph content and style. Filled in lazily for legacy elements by ensureParagraphs. */
+  paragraphs?: Paragraph[];
   fontFamily: string;
   fontSizePt: number;
   lineHeight: number;
