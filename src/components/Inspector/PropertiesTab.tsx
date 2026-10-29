@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { stateManager, numberToSuperscript } from '../../state';
+import { applyParagraphStyleToSelection } from '../../utils/paragraphStyleApply';
 import { fontManager } from '../../fontManager';
 import { PAGE_PRESETS, ProjectState, CanvasElement, TextElement, ImageElement, ShapeElement, TableElement, TableCell, ParagraphStyle, VectorPathElement } from '../../types';
 import { MathInput } from '../common/MathInput';
@@ -516,7 +517,7 @@ function TextInspector({
           onChange={(e) => {
             const val = (e.target as HTMLSelectElement).value;
             if (val) {
-              stateManager.applyParagraphStyle(element.id, val);
+              applyParagraphStyleToSelection(element.id, val);
             } else {
               stateManager.updateElement(element.id, { paragraphStyleId: undefined });
             }

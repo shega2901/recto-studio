@@ -7,6 +7,7 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { ProjectState } from '../types';
 import { stateManager } from '../state';
+import { applyParagraphStyleToSelection } from '../utils/paragraphStyleApply';
 
 interface QuickApplyProps {
   isOpen: boolean;
@@ -61,7 +62,7 @@ export function QuickApply({
       subtitle: `${style.fontFamily}, ${style.fontSizePt}pt`,
       action: () => {
         if (state.selectedElementId) {
-          stateManager.applyParagraphStyle(state.selectedElementId, style.id);
+          applyParagraphStyleToSelection(state.selectedElementId, style.id);
         }
       },
     });

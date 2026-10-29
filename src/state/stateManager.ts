@@ -1280,7 +1280,15 @@ export class StateManager {
     this.notify();
   }
 
-  public applyParagraphStyle(elementId: string, styleId: string) {
+  /**
+   * Applies a paragraph style.
+   *  - No `paragraphIndices` (or indices covering every paragraph): applies to the whole frame
+   *    like InDesign with the frame selected — sets the frame-level default style, clears
+   *    per-paragraph styles and local overrides, and updates the legacy top-level fields.
+   *  - `paragraphIndices` given: applies only to those paragraphs (cursor/selection in the
+   *    text editor). The frame-level style and legacy fields are left untouched.
+   */
+  public applyParagraphStyle(elementId: string, styleId: string, paragraphIndices?: number[]) {
     const style = this.state.paragraphStyles.find(s => s.id === styleId);
     if (!style) return;
 
@@ -1289,17 +1297,37 @@ export class StateManager {
     if (!el || el.type !== 'text') return;
 
     const textEl = el as TextElement;
-    textEl.paragraphStyleId = styleId;
-    textEl.fontFamily = style.fontFamily;
-    textEl.fontSizePt = style.fontSizePt;
-    textEl.lineHeight = style.lineHeight;
-    textEl.letterSpacingPt = style.letterSpacingPt;
-    textEl.color = style.color;
-    textEl.alignment = style.alignment;
-    textEl.snapToBaseline = style.snapToBaseline;
-    textEl.dropCapLines = style.dropCapLines;
-    textEl.opticalMarginAlignment = style.opticalMarginAlignment;
-    textEl.openTypeFeatures = style.openTypeFeatures ? { ...style.openTypeFeatures } : undefined;
+    const paragraphs = ensureParagraphs(textEl);
+
+    const wholeFrame =
+      !paragraphIndices ||
+      paragraphIndices.length === 0 ||
+      paragraphIndices.length >= paragraphs.length;
+
+    if (wholeFrame) {
+      textEl.paragraphStyleId = styleId;
+      textEl.fontFamily = style.fontFamily;
+      textEl.fontSizePt = style.fontSizePt;
+      textEl.lineHeight = style.lineHeight;
+      textEl.letterSpacingPt = style.letterSpacingPt;
+      textEl.color = style.color;
+      textEl.alignment = style.alignment;
+      textEl.snapToBaseline = style.snapToBaseline;
+      textEl.dropCapLines = style.dropCapLines;
+      textEl.opticalMarginAlignment = style.opticalMarginAlignment;
+      textEl.openTypeFeatures = style.openTypeFeatures ? { ...style.openTypeFeatures } : undefined;
+      for (const p of paragraphs) {
+        p.styleId = undefined;
+        delete p.overrides;
+      }
+    } else {
+      for (const i of paragraphIndices) {
+        const p = paragraphs[i];
+        if (!p) continue;
+        p.styleId = styleId;
+        delete p.overrides;
+      }
+    }
 
     this.pushHistory();
     this.notify();

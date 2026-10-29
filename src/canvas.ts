@@ -1917,6 +1917,31 @@ export class SpreadCanvas {
     this.render();
   }
 
+  /**
+   * Paragraph indices covered by the caret or selection in the inline text editor of `elementId`.
+   * Returns null when that element is not currently being edited, so callers fall back to
+   * applying to the whole frame. Paragraphs are split on '\n', matching the text model.
+   */
+  public getActiveParagraphSelection(elementId: string): number[] | null {
+    if (!this.activeInlineEditor || this.activeInlineEditor.elementId !== elementId) return null;
+    const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
+    if (typeof ta.selectionStart !== 'number' || typeof ta.selectionEnd !== 'number') return null;
+
+    const selStart = Math.min(ta.selectionStart, ta.selectionEnd);
+    const selEnd = Math.max(ta.selectionStart, ta.selectionEnd);
+    const lines = ta.value.split('\n');
+
+    const indices: number[] = [];
+    let charStart = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const charEnd = charStart + lines[i].length; // position after the last char, before the '\n'
+      // Overlap test (caret: selStart === selEnd).
+      if (selStart <= charEnd && selEnd >= charStart) indices.push(i);
+      charStart = charEnd + 1; // skip the '\n'
+    }
+    return indices.length > 0 ? indices : null;
+  }
+
   public openInlineTableCellEditor(tableId: string, e?: MouseEvent): void {
     const spread = stateManager.getActiveSpread();
     const el = spread.elements.find((item) => item.id === tableId);
