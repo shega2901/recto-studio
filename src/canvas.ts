@@ -19,6 +19,7 @@ import { stateManager, numberToSuperscript } from './state';
 import { collabSession } from './collab';
 import { assetStore } from './engine/assetStore';
 import { tableEngine } from './engine/tableEngine';
+import { paragraphIndicesForRange } from './utils/paragraphs';
 import {
   ParagraphFormat,
   resolveParagraphFormat,
@@ -421,6 +422,12 @@ export class SpreadCanvas {
 
   // Active in-place canvas overlay editor (WordPad/Figma style)
   private activeInlineEditor: { elementId: string; el: HTMLElement } | null = null;
+  /**
+   * Paragraphs that were selected when the inline editor lost focus to the UI (inspector button,
+   * Quick Apply, a dropdown). Clicking such a control blurs the textarea and closes the editor
+   * before the click fires, so without this a paragraph style would fall back to the whole frame.
+   */
+  private rememberedParagraphSelection: { elementId: string; indices: number[] } | null = null;
 
   // High-performance requestAnimationFrame render coalescing loop
   private renderRafId: number | null = null;
@@ -836,6 +843,7 @@ export class SpreadCanvas {
   }
 
   private handleMouseDown(e: MouseEvent) {
+    this.rememberedParagraphSelection = null;
     if (this.activeInlineEditor) {
       this.closeInlineTextEditor(true);
     }
@@ -1820,6 +1828,7 @@ export class SpreadCanvas {
     const textEl = el as TextElement;
 
     this.closeInlineTextEditor(true);
+    this.rememberedParagraphSelection = null;
 
     let pageIdx = spread.pages.findIndex((p) => p.id === textEl.pageId);
     if (pageIdx === -1) {
@@ -1883,10 +1892,14 @@ export class SpreadCanvas {
     }
 
     let isClosed = false;
-    const finish = (commit: boolean) => {
+    const finish = (commit: boolean, rememberSelection: boolean = false) => {
       if (isClosed) return;
       isClosed = true;
       const updatedText = textarea.value;
+      if (rememberSelection) {
+        const indices = paragraphIndicesForRange(updatedText, textarea.selectionStart, textarea.selectionEnd);
+        this.rememberedParagraphSelection = indices ? { elementId: textEl.id, indices } : null;
+      }
       textarea.remove();
       this.activeInlineEditor = null;
       if (commit && updatedText !== textEl.text) {
@@ -1906,8 +1919,10 @@ export class SpreadCanvas {
       }
     });
 
-    textarea.addEventListener('blur', () => {
-      finish(true);
+    textarea.addEventListener('blur', (fe: FocusEvent) => {
+      const next = fe.relatedTarget as Node | null;
+      const focusMovedToUi = next instanceof HTMLElement && !this.canvas.contains(next);
+      finish(true, focusMovedToUi);
     });
 
     const parent = this.canvas.parentElement || this.container;
@@ -1945,23 +1960,14 @@ export class SpreadCanvas {
    * applying to the whole frame. Paragraphs are split on '\n', matching the text model.
    */
   public getActiveParagraphSelection(elementId: string): number[] | null {
-    if (!this.activeInlineEditor || this.activeInlineEditor.elementId !== elementId) return null;
-    const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
-    if (typeof ta.selectionStart !== 'number' || typeof ta.selectionEnd !== 'number') return null;
-
-    const selStart = Math.min(ta.selectionStart, ta.selectionEnd);
-    const selEnd = Math.max(ta.selectionStart, ta.selectionEnd);
-    const lines = ta.value.split('\n');
-
-    const indices: number[] = [];
-    let charStart = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const charEnd = charStart + lines[i].length; // position after the last char, before the '\n'
-      // Overlap test (caret: selStart === selEnd).
-      if (selStart <= charEnd && selEnd >= charStart) indices.push(i);
-      charStart = charEnd + 1; // skip the '\n'
+    if (this.activeInlineEditor && this.activeInlineEditor.elementId === elementId) {
+      const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
+      return paragraphIndicesForRange(ta.value, ta.selectionStart, ta.selectionEnd);
     }
-    return indices.length > 0 ? indices : null;
+    if (this.rememberedParagraphSelection && this.rememberedParagraphSelection.elementId === elementId) {
+      return this.rememberedParagraphSelection.indices;
+    }
+    return null;
   }
 
   public openInlineTableCellEditor(tableId: string, e?: MouseEvent): void {

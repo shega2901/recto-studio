@@ -106,3 +106,29 @@ export function syncTextElement(el: TextElement, updates?: Partial<TextElement>)
 export function resolveParagraphStyleId(el: Pick<TextElement, 'paragraphStyleId'>, paragraph: Paragraph): string | undefined {
   return paragraph.styleId ?? el.paragraphStyleId;
 }
+
+/**
+ * Paragraph indices (text split on '\n') touched by a caret or selection in a textarea.
+ * A caret belongs to exactly one paragraph. A selection covers every paragraph it contains a
+ * character of, where a paragraph's trailing '\n' counts as part of it; a selection that merely
+ * ends where the next paragraph begins does not reach into that next paragraph.
+ */
+export function paragraphIndicesForRange(value: string, start: number | null, end: number | null): number[] | null {
+  if (typeof start !== 'number' || typeof end !== 'number') return null;
+  const selStart = Math.min(start, end);
+  const selEnd = Math.max(start, end);
+  const collapsed = selStart === selEnd;
+  const lines = value.split('\n');
+
+  const indices: number[] = [];
+  let charStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const charEnd = charStart + lines[i].length; // index of this paragraph's '\n' (or end of text)
+    const touches = collapsed
+      ? selStart >= charStart && selStart <= charEnd
+      : selStart <= charEnd && selEnd > charStart;
+    if (touches) indices.push(i);
+    charStart = charEnd + 1;
+  }
+  return indices.length > 0 ? indices : null;
+}

@@ -7,6 +7,7 @@ import {
   ensureParagraphs,
   reconcileParagraphs,
   resolveParagraphStyleId,
+  paragraphIndicesForRange,
 } from '../src/utils/paragraphs';
 
 function makeText(text: string, extra: Partial<TextElement> = {}): TextElement {
@@ -195,5 +196,42 @@ describe('Paragraph model inside stateManager', () => {
     expect(styles(getEl('model-sample').paragraphs!)).toEqual([undefined, undefined]);
     stateManager.redo();
     expect(styles(getEl('model-sample').paragraphs!)).toEqual(['style-h1', undefined]);
+  });
+});
+
+describe('paragraphIndicesForRange (caret / selection -> paragraphs)', () => {
+  const text = 'First\nSecond\n\nFourth'; // paragraphs at 0-5, 6-12, 13, 14-20
+  const at = (start: number, end: number = start) => paragraphIndicesForRange(text, start, end);
+
+  it('maps a caret to exactly one paragraph, including both ends of a line', () => {
+    expect(at(0)).toEqual([0]);
+    expect(at(5)).toEqual([0]); // end of "First", before its newline
+    expect(at(6)).toEqual([1]); // start of "Second"
+    expect(at(9)).toEqual([1]);
+    expect(at(13)).toEqual([2]); // the empty paragraph
+    expect(at(text.length)).toEqual([3]); // end of text
+  });
+
+  it('covers every paragraph a selection contains a character of', () => {
+    expect(at(2, 9)).toEqual([0, 1]);
+    expect(at(0, text.length)).toEqual([0, 1, 2, 3]);
+    expect(at(8, 8 + 1)).toEqual([1]);
+  });
+
+  it('does not reach into the next paragraph when a selection ends where it begins', () => {
+    expect(at(0, 6)).toEqual([0]); // "First" plus its newline
+    expect(at(6, 13)).toEqual([1]); // "Second" plus its newline
+  });
+
+  it('counts a selected paragraph mark as part of its paragraph', () => {
+    expect(at(5, 7)).toEqual([0, 1]); // newline of "First" + first char of "Second"
+  });
+
+  it('accepts a reversed (backwards) selection', () => {
+    expect(at(9, 2)).toEqual([0, 1]);
+  });
+
+  it('returns null when the positions are unavailable', () => {
+    expect(paragraphIndicesForRange(text, null, null)).toBeNull();
   });
 });
