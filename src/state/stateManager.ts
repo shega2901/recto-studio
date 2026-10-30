@@ -1271,8 +1271,13 @@ export class StateManager {
     this.state.paragraphStyles = this.state.paragraphStyles.filter(s => s.id !== id);
     for (const spread of this.state.spreads) {
       for (const el of spread.elements) {
-        if (el.type === 'text' && (el as TextElement).paragraphStyleId === id) {
-          (el as TextElement).paragraphStyleId = undefined;
+        if (el.type !== 'text') continue;
+        const textEl = el as TextElement;
+        if (textEl.paragraphStyleId === id) {
+          textEl.paragraphStyleId = undefined;
+        }
+        for (const p of textEl.paragraphs || []) {
+          if (p.styleId === id) p.styleId = undefined;
         }
       }
     }

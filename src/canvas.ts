@@ -19,8 +19,30 @@ import { stateManager, numberToSuperscript } from './state';
 import { collabSession } from './collab';
 import { assetStore } from './engine/assetStore';
 import { tableEngine } from './engine/tableEngine';
+import {
+  ParagraphFormat,
+  resolveParagraphFormat,
+  hasParagraphVariation,
+  getParagraphsForRender,
+  paragraphFormatsKey,
+} from './utils/paragraphFormat';
 
 export const MM_TO_PX = 3.7795275591;
+
+/** Sets the canvas font, fill, tracking and small-caps state for one paragraph; returns the font size in px. */
+function applyParagraphFormatToCtx(ctx: CanvasRenderingContext2D, fmt: ParagraphFormat, zoom: number): number {
+  const fontSizePx = (fmt.fontSizePt * (96 / 72)) * zoom;
+  ctx.font = `${fontSizePx}px ${fmt.fontFamily}`;
+  ctx.fillStyle = fmt.color;
+  const extended = ctx as any;
+  if (extended.letterSpacing !== undefined) {
+    extended.letterSpacing = fmt.letterSpacingPt ? `${(fmt.letterSpacingPt * (96 / 72) * zoom).toFixed(2)}px` : '0px';
+  }
+  if (extended.fontVariantCaps !== undefined) {
+    extended.fontVariantCaps = fmt.openTypeFeatures?.smallCaps ? 'all-small-caps' : 'normal';
+  }
+  return fontSizePx;
+}
 
 export function formatOpenTypeText(str: string, features?: OpenTypeFeatures): string {
   if (!features || !str) return str;
@@ -3459,7 +3481,22 @@ export class SpreadCanvas {
         if (rawCleanedText.includes('{index:')) {
           rawCleanedText = rawCleanedText.replace(/\{index:[^}]+\}/g, '');
         }
-        const processedText = formatOpenTypeText(rawCleanedText, text.openTypeFeatures);
+        // Per-paragraph typography. Only used when some paragraph has its own style or overrides,
+        // and when the paragraph count still matches after {cond:}/{xref:}/{index:} processing;
+        // otherwise the frame's own format applies to everything, exactly as before.
+        const rawParagraphs = rawCleanedText.split('\n');
+        const modelParagraphs = getParagraphsForRender(text);
+        const usePerParagraph =
+          obstacles.length === 0 &&
+          hasParagraphVariation(modelParagraphs) &&
+          modelParagraphs !== undefined &&
+          modelParagraphs.length === rawParagraphs.length;
+        const paraFormats: ParagraphFormat[] | null = usePerParagraph
+          ? modelParagraphs!.map(p => resolveParagraphFormat(text, p, state.paragraphStyles, activeGrepRules))
+          : null;
+        const processedText = paraFormats
+          ? rawParagraphs.map((p, i) => formatOpenTypeText(p, paraFormats[i].openTypeFeatures)).join('\n')
+          : formatOpenTypeText(rawCleanedText, text.openTypeFeatures);
 
         if (obstacles.length > 0) {
           const paragraphs = processedText.split('\n');
@@ -3664,51 +3701,65 @@ export class SpreadCanvas {
             isLastInPara: boolean;
             indentX: number;
             availWidth: number;
+            paraIdx: number;
           }
 
           const otKey = text.openTypeFeatures ? Object.entries(text.openTypeFeatures).filter(([_, v]) => v).map(([k]) => k).sort().join(',') : '';
-          const layoutKey = `${text.id}_${processedText}_${text.fontFamily}_${text.fontSizePt}_${text.lineHeight}_${text.letterSpacingPt || 0}_${text.columns}_${text.columnGutterMm}_${text.paddingMm}_${elScreenW}_${elScreenH}_${totalFootnoteHeightPx}_${text.dropCapLines}_${Boolean(text.opticalMarginAlignment)}_${Boolean(text.balanceColumns)}_${otKey}_${state.zoom}`;
+          // Paragraph formats are part of the key: restyling one paragraph changes the layout of the
+          // whole frame, and editing a style's definition must not reuse a stale cached layout.
+          const paraFmtKey = paraFormats ? paragraphFormatsKey(paraFormats) : '';
+          const layoutKey = `${text.id}_${processedText}_${text.fontFamily}_${text.fontSizePt}_${text.lineHeight}_${text.letterSpacingPt || 0}_${text.columns}_${text.columnGutterMm}_${text.paddingMm}_${elScreenW}_${elScreenH}_${totalFootnoteHeightPx}_${text.dropCapLines}_${Boolean(text.opticalMarginAlignment)}_${Boolean(text.balanceColumns)}_${otKey}_${state.zoom}_${paraFmtKey}`;
 
           let cachedLayout = this.textLayoutCache.get(layoutKey);
           let allLines: FormattedLine[];
           let dropCapChar = '';
           let dropCapWidth = 0;
           let dropCapFontSize = 0;
+          let dropCapParaIdxCached = -1;
 
           if (cachedLayout) {
             allLines = cachedLayout.allLines;
             dropCapChar = cachedLayout.dropCapChar;
             dropCapWidth = cachedLayout.dropCapWidth;
             dropCapFontSize = cachedLayout.dropCapFontSize;
+            dropCapParaIdxCached = cachedLayout.dropCapParaIdx ?? -1;
           } else {
-            // Drop Cap calculation
-            const dropCapLines = (text.dropCapLines && text.dropCapLines >= 2) ? Math.min(4, Math.floor(text.dropCapLines)) : 0;
             const paragraphs = processedText.split('\n');
+
+            // Drop Cap calculation: the first non-empty paragraph decides, using its own format.
+            const firstTextPara = paragraphs.findIndex(p => p.trimStart().length > 0);
+            const dropCapSource = paraFormats && firstTextPara >= 0
+              ? paraFormats[firstTextPara].dropCapLines
+              : text.dropCapLines;
+            const dropCapLines = (dropCapSource && dropCapSource >= 2) ? Math.min(4, Math.floor(dropCapSource)) : 0;
             let dropCapParaIdx = -1;
 
-            if (dropCapLines >= 2) {
-              for (let p = 0; p < paragraphs.length; p++) {
-                const trimmed = paragraphs[p].trimStart();
-                if (trimmed.length > 0) {
-                  dropCapParaIdx = p;
-                  dropCapChar = trimmed[0];
-                  dropCapFontSize = fontSizePx * (dropCapLines * 0.92);
-                  ctx.save();
-                  ctx.font = `bold ${dropCapFontSize}px ${text.fontFamily || 'serif'}`;
-                  dropCapWidth = ctx.measureText(dropCapChar).width + (4 * state.zoom);
-                  ctx.restore();
-                  break;
-                }
-              }
+            if (dropCapLines >= 2 && firstTextPara >= 0) {
+              const dropFmt = paraFormats ? paraFormats[firstTextPara] : null;
+              const dropBasePx = dropFmt ? (dropFmt.fontSizePt * (96 / 72)) * state.zoom : fontSizePx;
+              const dropFamily = dropFmt ? dropFmt.fontFamily : (text.fontFamily || 'serif');
+              dropCapParaIdx = firstTextPara;
+              dropCapChar = paragraphs[firstTextPara].trimStart()[0];
+              dropCapFontSize = dropBasePx * (dropCapLines * 0.92);
+              ctx.save();
+              ctx.font = `bold ${dropCapFontSize}px ${dropFamily}`;
+              dropCapWidth = ctx.measureText(dropCapChar).width + (4 * state.zoom);
+              ctx.restore();
             }
+            dropCapParaIdxCached = dropCapParaIdx;
 
             allLines = [];
             let dropCapLinesRemaining = dropCapLines;
 
             for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
               let para = paragraphs[pIdx];
+              const paraFmt = paraFormats ? paraFormats[pIdx] : null;
+              if (paraFmt) {
+                applyParagraphFormatToCtx(ctx, paraFmt, state.zoom);
+              }
+              const optMargin = paraFmt ? paraFmt.opticalMarginAlignment : Boolean(text.opticalMarginAlignment);
               if (!para.trim()) {
-                allLines.push({ text: '', isLastInPara: true, indentX: 0, availWidth: singleColWidthPx });
+                allLines.push({ text: '', isLastInPara: true, indentX: 0, availWidth: singleColWidthPx, paraIdx: pIdx });
                 continue;
               }
 
@@ -3732,7 +3783,7 @@ export class SpreadCanvas {
                 const testLineWords = [...currentLineWords, word];
                 const testLine = testLineWords.join(' ');
                 const metrics = ctx.measureText(testLine);
-                const trailingHang = getTrailingHangOffset(testLine, ctx, Boolean(text.opticalMarginAlignment));
+                const trailingHang = getTrailingHangOffset(testLine, ctx, optMargin);
 
                 if (metrics.width - trailingHang > lineMaxW) {
                   if (currentLineWords.length > 0) {
@@ -3741,6 +3792,7 @@ export class SpreadCanvas {
                       isLastInPara: false,
                       indentX: lineIndent,
                       availWidth: lineMaxW,
+                      paraIdx: pIdx,
                     });
                     if (isDropLine) {
                       dropCapLinesRemaining--;
@@ -3748,7 +3800,7 @@ export class SpreadCanvas {
                     currentLineWords = [];
                   }
 
-                  const wordTrailingHang = getTrailingHangOffset(word, ctx, Boolean(text.opticalMarginAlignment));
+                  const wordTrailingHang = getTrailingHangOffset(word, ctx, optMargin);
                   if (ctx.measureText(word).width - wordTrailingHang > lineMaxW) {
                     const subChunks = splitWordIntoFitChunks(word, lineMaxW, ctx);
                     for (let cIdx = 0; cIdx < subChunks.length - 1; cIdx++) {
@@ -3757,6 +3809,7 @@ export class SpreadCanvas {
                         isLastInPara: false,
                         indentX: lineIndent,
                         availWidth: lineMaxW,
+                        paraIdx: pIdx,
                       });
                       if (isDropLine) {
                         dropCapLinesRemaining--;
@@ -3780,6 +3833,7 @@ export class SpreadCanvas {
                   isLastInPara: true,
                   indentX: lineIndent,
                   availWidth: lineMaxW,
+                  paraIdx: pIdx,
                 });
                 if (isDropLine) {
                   dropCapLinesRemaining--;
@@ -3792,6 +3846,7 @@ export class SpreadCanvas {
               dropCapChar,
               dropCapWidth,
               dropCapFontSize,
+              dropCapParaIdx: dropCapParaIdxCached,
             };
             if (this.textLayoutCache.size > 200) {
               this.textLayoutCache.clear();
@@ -3800,6 +3855,7 @@ export class SpreadCanvas {
           }
 
           let lineIdx = 0;
+          let appliedParaIdx = -1; // paragraph whose format is currently set on ctx
           const totalLines = allLines.length;
           const isBalanced = Boolean(text.balanceColumns && colCount > 1);
           const baseLinesPerCol = Math.floor(totalLines / colCount);
@@ -3811,7 +3867,15 @@ export class SpreadCanvas {
             if (text.verticalAlign && (text.verticalAlign === 'middle' || text.verticalAlign === 'bottom')) {
               const maxLinesInCol = Math.floor((bottomLimit - (elScreenY + paddingPx)) / (lineSpacingPx || 1));
               const linesInThisCol = Math.min(totalLines, maxLinesInCol);
-              const textHeightPx = Math.max(0, (linesInThisCol - 1) * lineSpacingPx + fontSizePx);
+              let textHeightPx = Math.max(0, (linesInThisCol - 1) * lineSpacingPx + fontSizePx);
+              if (paraFormats && linesInThisCol > 0) {
+                textHeightPx = 0;
+                for (let li = 0; li < linesInThisCol; li++) {
+                  const f = paraFormats[allLines[li].paraIdx];
+                  const px = (f.fontSizePt * (96 / 72)) * state.zoom;
+                  textHeightPx += li < linesInThisCol - 1 ? px * f.lineHeight : px;
+                }
+              }
               const remainingSpace = Math.max(0, (bottomLimit - (elScreenY + paddingPx)) - textHeightPx);
               if (text.verticalAlign === 'middle') {
                 vOffsetPx = Math.floor(remainingSpace / 2);
@@ -3836,10 +3900,11 @@ export class SpreadCanvas {
 
             // If drop cap applies, render it once at the start of column 0
             if (c === 0 && dropCapChar && currentY + fontSizePx <= bottomLimit) {
-              const hangL = getLeadingHangOffset(dropCapChar, ctx, Boolean(text.opticalMarginAlignment));
+              const dropFmt = paraFormats && dropCapParaIdxCached >= 0 ? paraFormats[dropCapParaIdxCached] : null;
+              const hangL = getLeadingHangOffset(dropCapChar, ctx, dropFmt ? dropFmt.opticalMarginAlignment : Boolean(text.opticalMarginAlignment));
               ctx.save();
-              ctx.font = `bold ${dropCapFontSize}px ${text.fontFamily || 'serif'}`;
-              ctx.fillStyle = text.color || '#111111';
+              ctx.font = `bold ${dropCapFontSize}px ${dropFmt ? dropFmt.fontFamily : (text.fontFamily || 'serif')}`;
+              ctx.fillStyle = dropFmt ? dropFmt.color : (text.color || '#111111');
               ctx.textAlign = 'left';
               ctx.textBaseline = 'top';
               ctx.fillText(dropCapChar, colX - hangL, currentY);
@@ -3847,41 +3912,56 @@ export class SpreadCanvas {
             }
 
             while (lineIdx < allLines.length) {
-              if (currentY + fontSizePx > bottomLimit) {
+              const line = allLines[lineIdx];
+              const lineFmt = paraFormats && line ? paraFormats[line.paraIdx] : null;
+              const lFontPx = lineFmt ? (lineFmt.fontSizePt * (96 / 72)) * state.zoom : fontSizePx;
+              const lSpacing = lineFmt ? lFontPx * lineFmt.lineHeight : lineSpacingPx;
+              const lAlign = lineFmt ? lineFmt.alignment : text.alignment;
+              const lGrep = lineFmt ? lineFmt.grepStyles : activeGrepRules;
+              const lFamily = lineFmt ? lineFmt.fontFamily : (text.fontFamily || 'serif');
+              const lColor = lineFmt ? lineFmt.color : (text.color || '#111111');
+              const lOptMargin = lineFmt ? lineFmt.opticalMarginAlignment : Boolean(text.opticalMarginAlignment);
+              const lUseGrid = lineFmt ? Boolean(lineFmt.snapToBaseline && grid?.enabled) : useBaselineGrid;
+
+              if (currentY + lFontPx > bottomLimit) {
                 break; // column full, move to next column
               }
               if (linesInCol >= targetColLines) {
                 break; // balanced column quota reached, move to next column
               }
 
-              const line = allLines[lineIdx];
-              if (line && line.text) {
-                const hangL = getLeadingHangOffset(line.text, ctx, Boolean(text.opticalMarginAlignment));
-                const hangR = getTrailingHangOffset(line.text, ctx, Boolean(text.opticalMarginAlignment));
+              if (lineFmt && line.paraIdx !== appliedParaIdx) {
+                applyParagraphFormatToCtx(ctx, lineFmt, state.zoom);
+                appliedParaIdx = line.paraIdx;
+              }
 
-                if (text.alignment === 'center') {
-                  if (activeGrepRules && activeGrepRules.length > 0) {
+              if (line && line.text) {
+                const hangL = getLeadingHangOffset(line.text, ctx, lOptMargin);
+                const hangR = getTrailingHangOffset(line.text, ctx, lOptMargin);
+
+                if (lAlign === 'center') {
+                  if (lGrep && lGrep.length > 0) {
                     ctx.textAlign = 'left';
                     const totalW = ctx.measureText(line.text).width;
-                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX + (line.availWidth - hangL + hangR) / 2 - totalW / 2, currentY, fontSizePx, text.fontFamily || 'serif', text.color || '#111111', activeGrepRules);
+                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX + (line.availWidth - hangL + hangR) / 2 - totalW / 2, currentY, lFontPx, lFamily, lColor, lGrep);
                   } else {
                     ctx.textAlign = 'center';
                     ctx.fillText(line.text, colX + line.indentX + (line.availWidth - hangL + hangR) / 2, currentY);
                   }
-                } else if (text.alignment === 'right') {
-                  if (activeGrepRules && activeGrepRules.length > 0) {
+                } else if (lAlign === 'right') {
+                  if (lGrep && lGrep.length > 0) {
                     ctx.textAlign = 'left';
                     const totalW = ctx.measureText(line.text).width;
-                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX + line.availWidth + hangR - totalW, currentY, fontSizePx, text.fontFamily || 'serif', text.color || '#111111', activeGrepRules);
+                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX + line.availWidth + hangR - totalW, currentY, lFontPx, lFamily, lColor, lGrep);
                   } else {
                     ctx.textAlign = 'right';
                     ctx.fillText(line.text, colX + line.indentX + line.availWidth + hangR, currentY);
                   }
-                } else if (text.alignment === 'justify' && !line.isLastInPara) {
+                } else if (lAlign === 'justify' && !line.isLastInPara) {
                   const words = line.text.trim().split(/\s+/);
                   if (words.length <= 1) {
                     ctx.textAlign = 'left';
-                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX - hangL, currentY, fontSizePx, text.fontFamily || 'serif', text.color || '#111111', activeGrepRules);
+                    this.drawLineWithGrep(ctx, line.text, colX + line.indentX - hangL, currentY, lFontPx, lFamily, lColor, lGrep);
                   } else {
                     let totalWordsW = 0;
                     const wWidths: number[] = [];
@@ -3896,22 +3976,22 @@ export class SpreadCanvas {
                     let curWordX = colX + line.indentX - hangL;
                     ctx.textAlign = 'left';
                     for (let w = 0; w < words.length; w++) {
-                      this.drawLineWithGrep(ctx, words[w], curWordX, currentY, fontSizePx, text.fontFamily || 'serif', text.color || '#111111', activeGrepRules);
+                      this.drawLineWithGrep(ctx, words[w], curWordX, currentY, lFontPx, lFamily, lColor, lGrep);
                       curWordX += wWidths[w] + gap;
                     }
                   }
                 } else {
                   ctx.textAlign = 'left';
-                  this.drawLineWithGrep(ctx, line.text, colX + line.indentX - hangL, currentY, fontSizePx, text.fontFamily || 'serif', text.color || '#111111', activeGrepRules);
+                  this.drawLineWithGrep(ctx, line.text, colX + line.indentX - hangL, currentY, lFontPx, lFamily, lColor, lGrep);
                 }
               }
 
-              if (useBaselineGrid) {
-                const nextTentative = currentY + Math.max(lineSpacingPx, pitchPx * 0.8);
+              if (lUseGrid) {
+                const nextTentative = currentY + Math.max(lSpacing, pitchPx * 0.8);
                 const k = Math.ceil((nextTentative - gridStartY) / pitchPx);
                 currentY = gridStartY + (k * pitchPx);
               } else {
-                currentY += lineSpacingPx;
+                currentY += lSpacing;
               }
               linesInCol++;
               lineIdx++;
