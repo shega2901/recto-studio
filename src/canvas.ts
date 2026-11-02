@@ -3770,6 +3770,9 @@ export class SpreadCanvas {
           }
 
           let lineIdx = 0;
+          // The drop cap is drawn together with the first line that has text, so that it follows that
+          // line's alignment (centred / right) instead of staying at the column edge.
+          const dropCapLineIdx = dropCapChar ? allLines.findIndex(l => l.text.length > 0) : -1;
           const totalLines = allLines.length;
           const isBalanced = Boolean(text.balanceColumns && colCount > 1);
           const baseLinesPerCol = Math.floor(totalLines / colCount);
@@ -3804,18 +3807,6 @@ export class SpreadCanvas {
               }
             }
 
-            // If drop cap applies, render it once at the start of column 0
-            if (c === 0 && dropCapChar && currentY + fontSizePx <= bottomLimit) {
-              const hangL = getLeadingHangOffset(dropCapChar, ctx, Boolean(text.opticalMarginAlignment));
-              ctx.save();
-              ctx.font = `bold ${dropCapFontSize}px ${text.fontFamily || 'serif'}`;
-              ctx.fillStyle = text.color || '#111111';
-              ctx.textAlign = 'left';
-              ctx.textBaseline = 'top';
-              ctx.fillText(dropCapChar, colX - hangL, currentY);
-              ctx.restore();
-            }
-
             while (lineIdx < allLines.length) {
               if (currentY + fontSizePx > bottomLimit) {
                 break; // column full, move to next column
@@ -3828,6 +3819,28 @@ export class SpreadCanvas {
               if (line && line.text) {
                 const hangL = getLeadingHangOffset(line.text, ctx, Boolean(text.opticalMarginAlignment));
                 const hangR = getTrailingHangOffset(line.text, ctx, Boolean(text.opticalMarginAlignment));
+
+                if (lineIdx === dropCapLineIdx) {
+                  // Left/justified: at the column edge. Centred/right: immediately before the first
+                  // line's text, wherever that line starts.
+                  let dropX: number;
+                  if (text.alignment === 'center') {
+                    const lineW = ctx.measureText(line.text).width;
+                    dropX = colX + line.indentX + (line.availWidth - hangL + hangR) / 2 - lineW / 2 - line.indentX;
+                  } else if (text.alignment === 'right') {
+                    const lineW = ctx.measureText(line.text).width;
+                    dropX = colX + line.indentX + line.availWidth + hangR - lineW - line.indentX;
+                  } else {
+                    dropX = colX - getLeadingHangOffset(dropCapChar, ctx, Boolean(text.opticalMarginAlignment));
+                  }
+                  ctx.save();
+                  ctx.font = `bold ${dropCapFontSize}px ${text.fontFamily || 'serif'}`;
+                  ctx.fillStyle = text.color || '#111111';
+                  ctx.textAlign = 'left';
+                  ctx.textBaseline = 'top';
+                  ctx.fillText(dropCapChar, dropX, currentY);
+                  ctx.restore();
+                }
 
                 if (text.alignment === 'center') {
                   if (activeGrepRules && activeGrepRules.length > 0) {
