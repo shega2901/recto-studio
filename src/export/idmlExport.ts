@@ -140,21 +140,44 @@ ${styleDefs}
         const storyId = `Story_u${storyIndex++}`;
         storyRefs.push(`  <idPkg:Story src="Stories/${storyId}.xml"/>`);
 
-        // Create Story XML
-        const appliedStyle = state.paragraphStyles?.find(s => s.id === textEl.paragraphStyleId);
-        const styleName = appliedStyle ? appliedStyle.name : '$ID/NormalParagraphStyle';
-        const cleanContent = escapeXml(textEl.text || '');
+        // Create Story XML — one ParagraphStyleRange per paragraph, so each paragraph keeps its
+        // own style. Use the per-paragraph story when present (mixed styles), else split the plain
+        // text and give every paragraph the frame's style.
+        const styleNameFor = (styleId?: string): string => {
+          const s = styleId ? state.paragraphStyles?.find((ps) => ps.id === styleId) : undefined;
+          return s ? s.name : '$ID/NormalParagraphStyle';
+        };
+        const fontName = escapeXml((textEl.fontFamily || 'Inter').split(',')[0].trim().replace(/['"]/g, ''));
+        const fontSize = textEl.fontSizePt || 10;
+
+        const storyParas: { styleId?: string; text: string }[] = [];
+        const paraContent = textEl.storyContent || textEl.textContent;
+        if (paraContent && paraContent.paragraphs.length > 0) {
+          for (const p of paraContent.paragraphs) {
+            storyParas.push({ styleId: p.styleId ?? textEl.paragraphStyleId, text: p.runs.map((r) => r.text).join('') });
+          }
+        } else {
+          for (const line of (textEl.text || '').split('\n')) {
+            storyParas.push({ styleId: textEl.paragraphStyleId, text: line });
+          }
+        }
+
+        const paragraphRangesXml = storyParas
+          .map(
+            (p) => `    <ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/${escapeXml(styleNameFor(p.styleId))}">
+      <CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]"
+        PointSize="${fontSize}"
+        AppliedFont="${fontName}">
+        <Content>${escapeXml(p.text)}</Content>
+      </CharacterStyleRange>
+    </ParagraphStyleRange>`,
+          )
+          .join('\n');
 
         files[`Stories/${storyId}.xml`] = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <idPkg:Story xmlns:idPkg="http://schemas.adobe.com/idml/1.0/packaging" DOMVersion="8.0">
   <Story Self="${storyId}" AppliedTOCStyle="n" TrackChanges="false" StoryTitle="${escapeXml(textEl.id)}">
-    <ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/${escapeXml(styleName)}">
-      <CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]"
-        PointSize="${textEl.fontSizePt || 10}"
-        AppliedFont="${escapeXml((textEl.fontFamily || 'Inter').split(',')[0].trim().replace(/['"]/g, ''))}">
-        <Content>${cleanContent}</Content>
-      </CharacterStyleRange>
-    </ParagraphStyleRange>
+${paragraphRangesXml}
   </Story>
 </idPkg:Story>`;
 

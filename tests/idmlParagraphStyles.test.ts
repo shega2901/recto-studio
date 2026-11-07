@@ -143,3 +143,44 @@ describe('IDML import — per-paragraph styles through loadFromIdml', () => {
     expect(el!.text).toBe('The headline\nA body paragraph.');
   });
 });
+
+import { exportDocumentToIdml } from '../src/export/idmlExport';
+
+describe('IDML export — per-paragraph styles round-trip', () => {
+  it('emits one ParagraphStyleRange per paragraph and survives re-import', async () => {
+    // Import a mixed-style story...
+    const body = para('Headline 1', 'The headline') + para('Body Text', 'A body paragraph.') + para('Pullquote', 'A quote.');
+    await stateManager.loadFromIdml(buildIdml(body), 'mixed.idml');
+
+    // ...export the whole document back to IDML...
+    const exported = exportDocumentToIdml(stateManager.getState());
+    const xml = new TextDecoder('latin1').decode(exported);
+    // Each paragraph became its own range with its own applied style.
+    expect(xml).toContain('ParagraphStyle/Headline 1');
+    expect(xml).toContain('ParagraphStyle/Body Text');
+    expect(xml).toContain('ParagraphStyle/Pullquote');
+
+    // ...and re-importing preserves the per-paragraph styles.
+    const reimported = await parseIdmlPackage(exported, 'roundtrip.idml');
+    const el = reimported.spreads.flatMap((s) => s.elements).find((e) => e.type === 'text') as TextElement | undefined;
+    expect(el).toBeDefined();
+    expect(el!.text).toBe('The headline\nA body paragraph.\nA quote.');
+    expect(el!.storyContent!.paragraphs.map((p) => p.styleId)).toEqual(['style-h1', 'style-body', 'style-pullquote']);
+  });
+
+  it('splits a plain multi-paragraph frame into one range per paragraph', async () => {
+    stateManager.resetToDefault();
+    const spread = stateManager.getActiveSpread();
+    stateManager.addElement({
+      id: 'plain', type: 'text', pageId: spread.pages[0].id, x: 10, y: 10, width: 80, height: 40,
+      rotation: 0, opacity: 1, zIndex: 1, locked: false,
+      text: 'Line one\nLine two', fontFamily: 'Inter', fontSizePt: 10, lineHeight: 1.4, letterSpacingPt: 0,
+      color: '#111', alignment: 'left', columns: 1, columnGutterMm: 4,
+      borderColor: 'transparent', borderWidthMm: 0, backgroundColor: 'transparent', paddingMm: 2,
+    } as TextElement);
+
+    const reimported = await parseIdmlPackage(exportDocumentToIdml(stateManager.getState()), 'plain.idml');
+    const el = reimported.spreads.flatMap((s) => s.elements).find((e) => e.type === 'text' && (e as TextElement).text.includes('Line')) as TextElement;
+    expect(el.text).toBe('Line one\nLine two');
+  });
+});
