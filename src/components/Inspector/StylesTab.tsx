@@ -1,6 +1,7 @@
-import { useState, useRef } from 'preact/hooks';
+import { useState, useRef, useEffect } from 'preact/hooks';
 import { stateManager } from '../../state';
 import { applyParagraphStyleToSelection } from '../../utils/paragraphStyleApply';
+import { activeParagraphStyleId } from '../../utils/paragraphStyleTarget';
 import { fontManager } from '../../fontManager';
 import { ProjectState, ParagraphStyle, GrepStyleRule } from '../../types';
 
@@ -16,6 +17,24 @@ export function StylesTab({ state }: StylesTabProps) {
   const activeSpread = state.spreads[state.activeSpreadIndex] || state.spreads[0];
   const selectedEl = activeSpread?.elements.find((el) => el.id === state.selectedElementId);
   const isTextSelected = selectedEl?.type === 'text';
+
+  // Re-render while editing so the ACTIVE badge can follow the caret between paragraphs; the caret
+  // moving in the inline editor is not a state change on its own.
+  const [, forceSelectionTick] = useState(0);
+  useEffect(() => {
+    if (!isTextSelected) return;
+    const onSelectionChange = () => forceSelectionTick((t) => t + 1);
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, [isTextSelected]);
+
+  // The style to mark ACTIVE: the paragraph under the caret while editing, else the frame default.
+  const activeStyleId = isTextSelected
+    ? activeParagraphStyleId(
+        selectedEl as any,
+        (window as any).recto?.spreadCanvas?.getActiveTextSelection?.(selectedEl!.id) ?? null,
+      )
+    : undefined;
 
   const handleCreateStyle = () => {
     const newId = `style-${Date.now()}`;
@@ -51,7 +70,7 @@ export function StylesTab({ state }: StylesTabProps) {
       <div className="styles-list" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
         {state.paragraphStyles.map((style) => {
           const isEditing = editingStyleId === style.id;
-          const isAppliedToSelected = isTextSelected && (selectedEl as any).paragraphStyleId === style.id;
+          const isAppliedToSelected = isTextSelected && activeStyleId === style.id;
 
           if (isEditing) {
             return (
