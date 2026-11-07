@@ -100,6 +100,23 @@ describe('IDML import — per-paragraph styles', () => {
     expect(storyText(el.storyContent!)).toBe(el.text);
   });
 
+  it('drops the trailing <Br/> InDesign writes at each paragraph end (no spurious blank lines)', async () => {
+    // Real InDesign exports one ParagraphStyleRange per paragraph, each ending with a <Br/>
+    // paragraph return except the last. The range boundary is the paragraph break, so that
+    // trailing <Br/> must not become an extra empty paragraph.
+    const br = (style: string, text: string) =>
+      `<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/${style}"><CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]"><Content>${text}</Content><Br /></CharacterStyleRange></ParagraphStyleRange>`;
+    const last = (style: string, text: string) =>
+      `<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/${style}"><CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]"><Content>${text}</Content></CharacterStyleRange></ParagraphStyleRange>`;
+
+    const el = await importTextEl(
+      br('$ID/NormalParagraphStyle', 'First') + br('Headline 1', 'Second') + last('Body Text', 'Third'),
+    );
+
+    expect(el.text).toBe('First\nSecond\nThird');
+    expect(el.storyContent!.paragraphs.map((p) => p.styleId)).toEqual([undefined, 'style-h1', 'style-body']);
+  });
+
   it('resolves a custom style defined in Resources/Styles.xml', async () => {
     const styles = '<ParagraphStyle Self="ps-callout" Name="Callout" PointSize="18" />';
     const el = await importTextEl(para('Callout', 'A callout') + para('Body Text', 'Body'), styles);
