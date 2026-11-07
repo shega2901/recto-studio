@@ -2405,6 +2405,9 @@ export class StateManager {
       }
       this.state = newState;
       this.renumberPages();
+      // Imported frames whose paragraphs carry more than one style arrive with a storyContent;
+      // derive each frame's textContent (and distribute threaded stories) so they render.
+      this.reflowFormattedStories();
       this.pushHistory();
       this.notify();
     } catch (e) {

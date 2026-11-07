@@ -6,6 +6,8 @@ import {
   ImageElement,
   ShapeElement,
   ParagraphStyle,
+  StoryContent,
+  StoryParagraph,
   DocumentSettings,
   CanvasElement,
   DEFAULT_LAYERS,
@@ -577,6 +579,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
       alignment?: 'left' | 'center' | 'right' | 'justify';
       color?: string;
       grepStyles?: { pattern: string; color: string; bold?: boolean; italic?: boolean }[];
+      storyContent?: StoryContent;
     }
   >();
 
@@ -592,6 +595,9 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
 
       const pRanges = extractXmlTags(xml, 'ParagraphStyleRange');
       const paragraphs: string[] = [];
+      // One entry per emitted paragraph string, with the paragraph style of its range. An entry's
+      // text may hold several lines (a <Br/> forced line break), which are expanded below.
+      const paraStyleEntries: { text: string; styleId?: string; sourceStyle?: string }[] = [];
       let detectedStyleId: string | undefined;
       let detectedFontSize: number | undefined;
       let detectedFontFamily: string | undefined;
@@ -602,10 +608,16 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
 
       for (const pr of pRanges) {
         const applied = extractXmlAttr(pr, 'AppliedParagraphStyle');
+        let rangeStyleId: string | undefined;
+        let rangeSourceStyle: string | undefined;
         if (applied) {
           const cleanName = applied.replace('ParagraphStyle/', '');
+          rangeSourceStyle = cleanName;
           const match = parsedStyles.find((s) => s.name.toLowerCase() === cleanName.toLowerCase());
-          if (match && !detectedStyleId) detectedStyleId = match.id;
+          if (match) {
+            rangeStyleId = match.id;
+            if (!detectedStyleId) detectedStyleId = match.id;
+          }
         }
 
         const just = extractXmlAttr(pr, 'Justification') || '';
@@ -687,6 +699,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         const paraStr = paraTokens.join('');
         if (paraStr.length > 0) {
           paragraphs.push(paraStr);
+          paraStyleEntries.push({ text: paraStr, styleId: rangeStyleId, sourceStyle: rangeSourceStyle });
         }
       }
 
@@ -701,6 +714,37 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
 
       if (!fullText.trim() && !hasRenderableContent) {
         fullText = 'Imported text frame content';
+      }
+
+      // Per-paragraph styles: build a StoryContent only when the paragraphs do not all share a
+      // single style. A uniform story keeps the simpler `text` + `paragraphStyleId` path, which
+      // still renders drop caps, GREP styles and optical margins; a mixed story needs the richer
+      // StoryContent model so each paragraph can keep its own AppliedParagraphStyle.
+      const decodeEntities = (t: string) =>
+        t
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&apos;/g, "'");
+      let storyContent: StoryContent | undefined;
+      if (fullText.trim()) {
+        const storyParagraphs: StoryParagraph[] = [];
+        const resolvedStyleIds = new Set<string | undefined>();
+        for (const entry of paraStyleEntries) {
+          // A <Br/> split one range into several plain-text lines; each becomes its own paragraph
+          // carrying the range's style, so the paragraphs match fullText.split('\n') exactly.
+          for (const line of entry.text.split('\n')) {
+            const paragraph: StoryParagraph = { runs: [{ text: decodeEntities(line) }] };
+            if (entry.styleId) paragraph.styleId = entry.styleId;
+            if (entry.sourceStyle) paragraph.sourceStyle = entry.sourceStyle;
+            storyParagraphs.push(paragraph);
+            resolvedStyleIds.add(entry.styleId);
+          }
+        }
+        if (resolvedStyleIds.size > 1) {
+          storyContent = { version: 1, paragraphs: storyParagraphs };
+        }
       }
 
       const uniqueGrepRules: { pattern: string; color: string; bold?: boolean; italic?: boolean }[] = [];
@@ -722,6 +766,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         alignment: detectedAlignment,
         color: detectedColor,
         grepStyles: uniqueGrepRules.length > 0 ? uniqueGrepRules : undefined,
+        storyContent,
       });
     }
   }
@@ -877,6 +922,15 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         paddingMm,
         paragraphStyleId: storyData?.styleId,
       };
+
+      // Attach the per-paragraph story so reflow (in loadFromIdml) can render each paragraph in
+      // its own style. Only present for stories whose paragraphs use more than one style.
+      if (storyData?.storyContent) {
+        textEl.storyContent = {
+          version: 1,
+          paragraphs: storyData.storyContent.paragraphs.map((p) => ({ ...p, runs: p.runs.map((r) => ({ ...r })) })),
+        };
+      }
 
       if (storyData?.grepStyles && storyData.grepStyles.length > 0) {
         (textEl as any).grepStyles = storyData.grepStyles;
