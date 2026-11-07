@@ -950,10 +950,15 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         (textEl as any).parentStoryId = parentStory;
       }
 
+      // InDesign writes "n" (and "kInvalidRef") for "no linked frame". Treat both as no link —
+      // otherwise the frame gets a dangling prevFrameId/nextFrameId ("idml-n"), which hides its
+      // story from reflow (so it renders in one style) and breaks applying a style to it.
+      const isFrameRef = (ref: string | null): ref is string =>
+        !!ref && ref !== 'n' && ref !== 'kInvalidRef';
       const nextFrame = extractXmlAttr(tfXml, 'NextTextFrame');
       const prevFrame = extractXmlAttr(tfXml, 'PreviousTextFrame');
-      if (nextFrame && nextFrame !== 'kInvalidRef') textEl.nextFrameId = `idml-${nextFrame}`;
-      if (prevFrame && prevFrame !== 'kInvalidRef') textEl.prevFrameId = `idml-${prevFrame}`;
+      if (isFrameRef(nextFrame)) textEl.nextFrameId = `idml-${nextFrame}`;
+      if (isFrameRef(prevFrame)) textEl.prevFrameId = `idml-${prevFrame}`;
 
       spreadElements.push(textEl);
     }

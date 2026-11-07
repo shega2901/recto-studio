@@ -16,7 +16,7 @@ function buildIdml(storyBody: string, stylesXml = ''): Uint8Array {
 <idPkg:Spread xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="21.4">
   <Spread Self="sp1">
     <Page Self="p1" GeometricBounds="0 0 841.89 595.276" />
-    <TextFrame Self="tf1" ParentStory="story1" ItemTransform="1 0 0 1 0 0" GeometricBounds="0 0 200 400" />
+    <TextFrame Self="tf1" ParentStory="story1" PreviousTextFrame="n" NextTextFrame="n" ItemTransform="1 0 0 1 0 0" GeometricBounds="0 0 200 400" />
   </Spread>
 </idPkg:Spread>`;
   const story = `${HEADER}
@@ -115,6 +115,14 @@ describe('IDML import — per-paragraph styles', () => {
 
     expect(el.text).toBe('First\nSecond\nThird');
     expect(el.storyContent!.paragraphs.map((p) => p.styleId)).toEqual([undefined, 'style-h1', 'style-body']);
+  });
+
+  it('treats InDesign "n" text-frame links as no link (frame stays a standalone story head)', async () => {
+    const state = await parseIdmlPackage(buildIdml(para('Headline 1', 'A') + para('Body Text', 'B')), 'test.idml');
+    const el = state.spreads.flatMap((s) => s.elements).find((e) => e.type === 'text') as TextElement;
+    // A dangling "idml-n" link would hide the story from reflow and break styling it.
+    expect(el.prevFrameId).toBeUndefined();
+    expect(el.nextFrameId).toBeUndefined();
   });
 
   it('resolves a custom style defined in Resources/Styles.xml', async () => {
