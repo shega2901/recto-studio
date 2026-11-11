@@ -29,6 +29,32 @@ export function paragraphIndicesForRange(value: string, start: number | null, en
   return indices.length > 0 ? indices : null;
 }
 
+interface StyledParagraphs {
+  paragraphs: { styleId?: string }[];
+}
+
+/**
+ * The paragraph style to highlight as "active" in the Styles panel for a text frame.
+ *
+ * While the frame is being edited, it is the style of the paragraph(s) the caret/selection touches
+ * (their own style, else the frame default); a selection spanning paragraphs of different styles
+ * returns undefined (nothing single to highlight). With no editor selection, or a frame that has no
+ * per-paragraph content, it is the frame-level style, matching the previous behaviour.
+ */
+export function activeParagraphStyleId(
+  el: { paragraphStyleId?: string; textContent?: StyledParagraphs; storyContent?: StyledParagraphs },
+  selection: { text: string; start: number; end: number } | null,
+): string | undefined {
+  const content = el.textContent ?? el.storyContent;
+  if (!selection || !content) return el.paragraphStyleId;
+
+  const indices = paragraphIndicesForRange(selection.text, selection.start, selection.end);
+  if (!indices) return el.paragraphStyleId;
+
+  const resolved = new Set(indices.map((i) => content.paragraphs[i]?.styleId ?? el.paragraphStyleId));
+  return resolved.size === 1 ? [...resolved][0] : undefined;
+}
+
 export type ParagraphStyleTarget =
   | { kind: 'frame' }
   | { kind: 'range'; start: number; end: number };
