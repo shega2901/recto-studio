@@ -186,6 +186,42 @@ test('applies a paragraph style under the caret and goes on editing', async ({ p
   expect(committed.styles).toEqual(['ps-head', 'ps-quote', 'ps-quote']);
 });
 
+test('marks the style of the paragraph under the caret as active in the Styles panel', async ({ page }) => {
+  await openStyledProject(page);
+  // The panel stays open while the frame is edited; the badge sits on the card of the active style.
+  await page.getByText('Styles', { exact: true }).first().click();
+  const active = page.locator('.style-item-card').filter({ hasText: 'ACTIVE' });
+  const point = await bodyLine(page);
+  await page.mouse.dblclick(point.x, point.y);
+  await expect(page.locator('.canvas-inline-editor')).toBeFocused();
+  await expect(active).toHaveCount(1);
+  await expect(active).toHaveText(/^Body/);
+
+  await page.keyboard.press('Control+Home');
+  await expect(active).toHaveText(/^Heading/);
+  await page.keyboard.press('Control+End');
+  await expect(active).toHaveText(/^Quote/);
+
+  // A Return at the end of the heading starts a paragraph in the heading's style, before the document knows it.
+  await page.keyboard.press('Control+Home');
+  await page.keyboard.press('End');
+  await page.keyboard.press('Enter');
+  await expect(active).toHaveText(/^Heading/);
+  await page.keyboard.press('ArrowDown');
+  await expect(active).toHaveText(/^Body/);
+
+  // A selection across paragraphs of different styles has no single active style.
+  await page.keyboard.press('Control+a');
+  await expect(active).toHaveCount(0);
+  await page.keyboard.press('Control+Home');
+  await expect(active).toHaveText(/^Heading/);
+
+  // The editor stays where it was and the panel keeps its answer after the edit is committed.
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator('.canvas-inline-editor')).toHaveCount(0);
+  expect((await frameState(page)).styles).toEqual(['ps-head', 'ps-head', 'ps-body', 'ps-quote']);
+});
+
 // The in-place editor is loaded on demand, outside the startup bundle.
 const EDITOR_MODULE = /\/liveTextCanvas[^/]*\.(js|ts)(\?|$)/;
 

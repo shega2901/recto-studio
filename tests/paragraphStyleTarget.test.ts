@@ -155,3 +155,49 @@ describe('applyParagraphStyleToSelection (UI bridge)', () => {
     expect(get().paragraphStyleId).toBe('style-h1');
   });
 });
+
+import { activeParagraphStyleId } from '../src/utils/paragraphStyleTarget';
+
+describe('activeParagraphStyleId (ACTIVE badge target)', () => {
+  const content = { paragraphs: [{ styleId: undefined }, { styleId: 'style-h1' }, { styleId: 'style-pullquote' }] };
+  const el = { paragraphStyleId: 'style-body', textContent: content };
+  const text = 'Heading\nMiddle\nQuote';
+  const sel = (start: number, end: number = start) => ({ text, start, end });
+
+  it('returns the paragraph style under the caret', () => {
+    expect(activeParagraphStyleId(el, sel(10))).toBe('style-h1'); // caret in paragraph 1
+    expect(activeParagraphStyleId(el, sel(text.length))).toBe('style-pullquote'); // paragraph 2
+  });
+
+  it('falls back to the frame default for a paragraph with no own style', () => {
+    expect(activeParagraphStyleId(el, sel(2))).toBe('style-body'); // paragraph 0 -> frame default
+  });
+
+  it('returns undefined when a selection spans paragraphs of different styles', () => {
+    expect(activeParagraphStyleId(el, sel(2, 10))).toBeUndefined();
+  });
+
+  it('returns the shared style when a selection spans paragraphs that resolve the same', () => {
+    const same = { paragraphStyleId: 'style-body', textContent: { paragraphs: [{ styleId: 'style-h1' }, { styleId: 'style-h1' }] } };
+    expect(activeParagraphStyleId(same, { text: 'A\nB', start: 0, end: 3 })).toBe('style-h1');
+  });
+
+  it('uses the frame style when there is no editor selection', () => {
+    expect(activeParagraphStyleId(el, null)).toBe('style-body');
+  });
+
+  it('uses the frame style for a frame with no per-paragraph content', () => {
+    expect(activeParagraphStyleId({ paragraphStyleId: 'style-body' }, sel(3))).toBe('style-body');
+  });
+
+  it('follows the paragraphs of the text being typed, not the ones the document still has', () => {
+    // A Return after "Heading" added a paragraph (it takes the heading's style) that the frame has not stored yet.
+    const typed = 'Heading\n\nMiddle\nQuote';
+    const paragraphs = [{ styleId: undefined }, { styleId: undefined }, { styleId: 'style-h1' }, { styleId: 'style-pullquote' }];
+    const caretIn = (offset: number) => ({ text: typed, start: offset, end: offset, paragraphs });
+    expect(activeParagraphStyleId(el, caretIn(typed.indexOf('Middle') + 2))).toBe('style-h1');
+    expect(activeParagraphStyleId(el, caretIn(typed.length))).toBe('style-pullquote');
+    // Read against the frame's three paragraphs, the same caret falls off the end and gets the frame default.
+    expect(activeParagraphStyleId(el, { text: typed, start: typed.length, end: typed.length })).toBe('style-body');
+  });
+});
