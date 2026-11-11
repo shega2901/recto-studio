@@ -243,6 +243,12 @@ export class SpreadCanvas {
 
   // Active in-place canvas overlay editor (WordPad/Figma style)
   private activeInlineEditor: { elementId: string; el: HTMLElement } | null = null;
+  /**
+   * Selection in the inline editor at the moment it lost focus to the UI (inspector button, Quick Apply,
+   * a dropdown). Clicking such a control blurs the textarea and closes the editor before the click fires,
+   * so without this a paragraph style would fall back to the whole frame.
+   */
+  private rememberedTextSelection: { elementId: string; text: string; start: number; end: number } | null = null;
 
   // High-performance requestAnimationFrame render coalescing loop
   private renderRafId: number | null = null;
@@ -606,6 +612,7 @@ export class SpreadCanvas {
   }
 
   private handleMouseDown(e: MouseEvent) {
+    this.rememberedTextSelection = null;
     if (this.activeInlineEditor) {
       this.closeInlineTextEditor(true);
     }
@@ -1593,6 +1600,7 @@ export class SpreadCanvas {
     const textEl = el as TextElement;
 
     this.closeInlineTextEditor(true);
+    this.rememberedTextSelection = null;
 
     let pageIdx = spread.pages.findIndex((p) => p.id === textEl.pageId);
     if (pageIdx === -1) {
@@ -1656,10 +1664,18 @@ export class SpreadCanvas {
     }
 
     let isClosed = false;
-    const finish = (commit: boolean) => {
+    const finish = (commit: boolean, rememberSelection: boolean = false) => {
       if (isClosed) return;
       isClosed = true;
       const updatedText = textarea.value;
+      if (rememberSelection) {
+        this.rememberedTextSelection = {
+          elementId: textEl.id,
+          text: updatedText,
+          start: textarea.selectionStart,
+          end: textarea.selectionEnd,
+        };
+      }
       textarea.remove();
       this.activeInlineEditor = null;
       if (commit && updatedText !== textEl.text) {
@@ -1679,8 +1695,11 @@ export class SpreadCanvas {
       }
     });
 
-    textarea.addEventListener('blur', () => {
-      finish(true);
+    textarea.addEventListener('blur', (fe: FocusEvent) => {
+      // Remember the selection only when focus moved to a control outside the canvas.
+      const next = fe.relatedTarget as Node | null;
+      const focusMovedToUi = next instanceof HTMLElement && !this.canvas.contains(next);
+      finish(true, focusMovedToUi);
     });
 
     const parent = this.canvas.parentElement || this.container;
@@ -1694,6 +1713,24 @@ export class SpreadCanvas {
     textarea.focus();
     textarea.select();
     this.render();
+  }
+
+  /**
+   * Caret / selection in the inline text editor of `elementId`, as offsets into the editor's text.
+   * Falls back to the selection remembered when the editor just lost focus to the UI.
+   * Returns null when that frame is not being edited, so callers apply to the whole frame.
+   */
+  public getActiveTextSelection(elementId: string): { text: string; start: number; end: number } | null {
+    if (this.activeInlineEditor && this.activeInlineEditor.elementId === elementId) {
+      const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
+      if (typeof ta.selectionStart !== 'number' || typeof ta.selectionEnd !== 'number') return null;
+      return { text: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
+    }
+    const remembered = this.rememberedTextSelection;
+    if (remembered && remembered.elementId === elementId) {
+      return { text: remembered.text, start: remembered.start, end: remembered.end };
+    }
+    return null;
   }
 
   public closeInlineTextEditor(commit: boolean = true): void {
