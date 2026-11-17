@@ -19,6 +19,14 @@ import { isInddBuffer } from './engine/inddParser';
 import { reflowStoryState } from './engine/publicationReferences';
 import { storyText } from './engine/storyContent';
 import { validGradient } from './engine/fillGradients';
+import { masterTargetPage } from './engine/pageLabels';
+
+/**
+ * InDesign writes special characters as processing instructions inside <Content>. The current page
+ * number becomes the document's page token; markers that only steer InDesign's own composer
+ * (indent to here, end nested style, …) have no character of their own and are dropped.
+ */
+const inDesignSpecialCharacters = (text: string) => text.replace(/<\?ACE\s+(\d+)\s*\?>/g, (_, code: string) => code === '18' ? '{{page}}' : '');
 
 const decodeStoryXml = (text: string) => text.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, value: string) => {
   if (value.startsWith('#')) { const n = value[1].toLowerCase() === 'x' ? parseInt(value.slice(2), 16) : Number(value.slice(1)); return n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff) ? String.fromCodePoint(n) : entity; }
@@ -69,19 +77,69 @@ function styleProperty(xml: string, header: string, name: string): string | unde
   return value === undefined ? undefined : decodeStoryXml(value.trim());
 }
 
+const OBJECT_APPEARANCE = ['FillColor', 'FillTint', 'StrokeColor', 'StrokeWeight', 'StrokeTint'] as const;
+
+/** Stroke and fill of each object style, with what it inherits from the style it is based on. */
+function resolveObjectStyleAppearance(xml: string): Map<string, Record<string, string>> {
+  const definitions = extractXmlTags(xml, 'ObjectStyle').map(tag => {
+    const header = tag.slice(0, tag.indexOf('>') + 1);
+    const properties: Record<string, string> = {};
+    for (const key of OBJECT_APPEARANCE) {
+      const value = extractXmlAttr(header, key);
+      if (value) properties[key] = value;
+    }
+    return { id: extractXmlAttr(header, 'Self') || '', parentId: styleProperty(tag, header, 'BasedOn'), properties };
+  }).filter(definition => definition.id);
+  const byId = new Map(definitions.map(definition => [definition.id, definition]));
+  const resolved = new Map<string, Record<string, string>>();
+  const resolve = (id: string, seen: Set<string>): Record<string, string> => {
+    const known = resolved.get(id);
+    if (known) return known;
+    const definition = byId.get(id);
+    if (!definition || seen.has(id)) return {};
+    seen.add(id);
+    const parentId = definition.parentId && (byId.has(definition.parentId) ? definition.parentId : `ObjectStyle/${definition.parentId}`);
+    const result = { ...(parentId ? resolve(parentId, seen) : {}), ...definition.properties };
+    resolved.set(id, result);
+    return result;
+  };
+  for (const definition of definitions) resolve(definition.id, new Set());
+  return resolved;
+}
+
+/** Write each frame's object-style stroke and fill onto its tag where the frame does not set its own. */
+function withObjectStyleAppearance(xml: string, styles: Map<string, Record<string, string>>): string {
+  if (!styles.size) return xml;
+  return xml.replace(/<(TextFrame|Rectangle|Oval|Polygon|GraphicLine)\b[^>]*>/g, tag => {
+    const style = styles.get(decodeStoryXml(extractXmlAttr(tag, 'AppliedObjectStyle') || ''));
+    if (!style) return tag;
+    const missing = OBJECT_APPEARANCE.filter(key => style[key] !== undefined && extractXmlAttr(tag, key) === null)
+      .map(key => ` ${key}="${style[key]}"`).join('');
+    return missing ? tag.replace(/\s*(\/?)>$/, `${missing}$1>`) : tag;
+  });
+}
+
 function resolveParagraphStyleProperties(xml: string) {
   const definitions = extractXmlTags(xml, 'ParagraphStyle').map((tag, index) => {
     const header = tag.slice(0, tag.indexOf('>') + 1);
     const property = (name: string) => styleProperty(tag, header, name);
     const id = property('Self') || `#anonymous-${index}`;
     const properties: Record<string, string> = {};
-    for (const key of ['AppliedFont', 'PointSize', 'Leading', 'Justification', 'FillColor', 'FillTint', 'DropCapLines']) {
+    for (const key of ['AppliedFont', 'PointSize', 'Leading', 'AutoLeading', 'Justification', 'FillColor', 'FillTint', 'DropCapLines',
+      'FontStyle', 'GridAlignment', 'Tracking']) {
       const value = property(key);
       if (value) properties[key] = value;
     }
     return { id, name: property('Name'), parentId: property('BasedOn'), properties };
   });
   const byId = new Map(definitions.map(def => [def.id, def]));
+  // InDesign writes BasedOn for its built-in styles without the type prefix their Self carries
+  // ("$ID/[No paragraph style]" against "ParagraphStyle/$ID/[No paragraph style]").
+  for (const definition of definitions) {
+    if (definition.parentId && !byId.has(definition.parentId) && byId.has(`ParagraphStyle/${definition.parentId}`)) {
+      definition.parentId = `ParagraphStyle/${definition.parentId}`;
+    }
+  }
   const resolved = new Map<string, Record<string, string>>();
   for (const definition of definitions) {
     const chain: typeof definitions = [];
@@ -600,6 +658,9 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
   let columnCount = 2;
   let columnGutterMm = 5;
   let docTitle = 'Imported InDesign Project';
+  let baselineIncrementPt = 12;
+  let baselineStartMm: number | undefined;
+  let baselineFromMargin = false;
 
   const prefFile = files.get('Resources/Preferences.xml') || files.get('designmap.xml');
   if (prefFile) {
@@ -630,6 +691,17 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     if (!isNaN(cols) && cols >= 1) columnCount = cols;
     const gutterPt = parseFloat(extractXmlAttr(xml, 'ColumnGutter') || '14.17');
     if (!isNaN(gutterPt)) columnGutterMm = Math.round(gutterPt * PT_TO_MM);
+
+    const grid = xml.match(/<GridPreference\b[^>]*>/)?.[0];
+    if (grid) {
+      const division = parseFloat(extractXmlAttr(grid, 'BaselineDivision') || '');
+      const start = parseFloat(extractXmlAttr(grid, 'BaselineStart') || '');
+      if (Number.isFinite(division) && division > 0) baselineIncrementPt = Math.round(division * 100) / 100;
+      if (Number.isFinite(start) && start >= 0) {
+        baselineStartMm = Math.round(start * PT_TO_MM * 100) / 100;
+        baselineFromMargin = extractXmlAttr(grid, 'BaselineGridRelativeOption') === 'TopOfMarginOfBaselineGridRelativeOption';
+      }
+    }
   }
 
   // 2. Parse Paragraph Styles from Resources/Styles.xml
@@ -639,12 +711,21 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
   if (stylesFile) {
     const xml = textDecoder.decode(stylesFile);
     const usedIds = new Set(parsedStyles.map(style => style.id));
-    for (const { id, name, properties } of resolveParagraphStyleProperties(xml)) {
-      if (!name || name.startsWith('$ID') || name === 'NormalParagraphStyle') continue;
+    for (const { id, name: idmlName, properties } of resolveParagraphStyleProperties(xml)) {
+      // InDesign's [Basic Paragraph] is a real style text uses; only the [No paragraph style] root is not.
+      const basic = idmlName === '$ID/NormalParagraphStyle' || idmlName === 'NormalParagraphStyle';
+      if (!idmlName || (idmlName.startsWith('$ID') && !basic)) continue;
+      const name = basic ? '[Basic Paragraph]' : idmlName;
 
       const importedSize = parseFloat(properties.PointSize ?? '');
       const ptSize = Number.isFinite(importedSize) && importedSize > 0 ? importedSize : 10;
-      const leadingPt = parseFloat(properties.Leading ?? '13');
+      const leadingPt = parseFloat(properties.Leading ?? '');
+      // "Auto" leading is a percentage of the type size, 120 unless the style says otherwise.
+      const autoLeading = parseFloat(properties.AutoLeading ?? '');
+      const lineHeight = Number.isFinite(leadingPt) && leadingPt > 0 ? Math.round((leadingPt / ptSize) * 100) / 100
+        : Number.isFinite(autoLeading) && autoLeading > 0 ? autoLeading / 100 : 1.2;
+      const fontStyle = properties.FontStyle || '';
+      const tracking = parseFloat(properties.Tracking ?? '');
       const fillTint = parseFloat(properties.FillTint ?? '');
       const just = properties.Justification || 'LeftAlign';
 
@@ -662,17 +743,24 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         name,
         fontFamily: properties.AppliedFont || 'serif',
         fontSizePt: ptSize,
-        lineHeight: Number.isFinite(leadingPt) && leadingPt > 0 ? Math.round((leadingPt / ptSize) * 100) / 100 : 1.3,
-        letterSpacingPt: 0,
+        lineHeight,
+        // Tracking is in thousandths of an em.
+        letterSpacingPt: Number.isFinite(tracking) ? Math.round(tracking * ptSize / 10) / 100 : 0,
         color: properties.FillColor ? resolveIdmlColor(properties.FillColor, Number.isFinite(fillTint) ? fillTint : undefined, colorsMap) : '#1a1a1a',
         alignment,
-        snapToBaseline: true,
+        // Only text set to align to the baseline grid snaps to it; InDesign's default is not to.
+        snapToBaseline: !!properties.GridAlignment && properties.GridAlignment !== 'None',
         dropCapLines: parseInt(properties.DropCapLines ?? '', 10) || 0,
       };
+      if (/bold|black|heavy|semibold|demi/i.test(fontStyle)) style.bold = true;
+      if (/italic|oblique/i.test(fontStyle)) style.italic = true;
       parsedStyles.push(style);
       styleRefs.set(id, style);
     }
   }
+
+  // Frames and lines take the stroke and fill their object style gives them unless they override it.
+  const objectStyles = stylesFile ? resolveObjectStyleAppearance(textDecoder.decode(stylesFile)) : new Map<string, Record<string, string>>();
 
   // 3. Parse Stories from Stories/Story_*.xml
   const storiesMap = new Map<
@@ -775,7 +863,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
               paraTokens.push(resolved);
               rangeTokens.push(resolved);
             } else {
-              const textContent = tok.replace(/<Content[^>]*>/, '').replace(/<\/Content>/, '');
+              const textContent = inDesignSpecialCharacters(tok.replace(/<Content[^>]*>/, '').replace(/<\/Content>/, ''));
               paraTokens.push(textContent);
               rangeTokens.push(textContent);
             }
@@ -894,6 +982,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
 
   // 5. Parse Spreads and Elements
   const spreads: Spread[] = [];
+  const pageMastersBySpread = new Map<Spread, Map<string, string | null>>();
   const masterSpreads: MasterSpread[] = [];
   const masterFiles = [...files.keys()].filter(name => /^MasterSpreads\/MasterSpread_.*\.xml$/i.test(name));
   const orderedFiles = [...spreadFileOrder, ...masterFiles];
@@ -904,13 +993,18 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     const sContent = files.get(sFile);
     if (!sContent) continue;
 
-    const xml = textDecoder.decode(sContent);
+    const xml = withObjectStyleAppearance(textDecoder.decode(sContent), objectStyles);
     const master = sFile.startsWith('MasterSpreads/');
     const parsedPages = parseSpreadPages(xml, master ? 1 : globalPageCounter, facingPages, pageWidthMm, pageHeightMm);
     if (!master) globalPageCounter += parsedPages.length;
     const spreadTag = xml.match(master ? /<MasterSpread\b[^>]*>/i : /<Spread\b[^>]*>/i)?.[0] || '';
     const pageTag = xml.match(/<Page\b[^>]*>/i)?.[0] || '';
     const appliedMaster = [extractXmlAttr(spreadTag, 'AppliedMaster'), extractXmlAttr(pageTag, 'AppliedMaster')].find(id => id && id !== 'n' && id !== 'kInvalidRef');
+    // InDesign applies a parent to each page; the editor to a spread. Kept to settle that below.
+    const pageMasters = new Map(extractXmlTags(xml, 'Page').map(tag => {
+      const applied = extractXmlAttr(tag, 'AppliedMaster');
+      return [extractXmlAttr(tag, 'Self') || '', applied && applied !== 'n' && applied !== 'kInvalidRef' ? applied : null] as const;
+    }));
 
     // Adopt document width/height from the first parsed page if appropriate
     if (!master && sIdx === 0 && parsedPages[0]) {
@@ -1260,7 +1354,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
       pages,
       elements: spreadElements,
       masterSpreadId: appliedMaster || null,
-    });
+    }) && pageMastersBySpread.set(spreads[spreads.length - 1], pageMasters);
   }
 
   // Post-Process Story Flow and Text Threading across Spreads
@@ -1348,8 +1442,9 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     columnGutterMm,
     baselineGrid: {
       enabled: true,
-      incrementPt: 12,
-      startMm: topMarginMm,
+      incrementPt: baselineIncrementPt,
+      // The grid starts from the top of the page or the top margin, as the document says.
+      startMm: baselineStartMm === undefined ? topMarginMm : baselineStartMm + (baselineFromMargin ? topMarginMm : 0),
     },
   };
 
@@ -1375,6 +1470,10 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     activeLayerId: layerIds.get(activeLayer || '') || layers.find(layer => layer.visible && !layer.locked)?.id || layers[0].id,
   };
   const knownMasters = new Set(masterSpreads.map(master => master.id));
+  for (const spread of spreads) {
+    const perPage = pageMastersBySpread.get(spread);
+    if (perPage) settlePageMasters(spread, perPage, masterSpreads);
+  }
   for (const spread of spreads) if (spread.masterSpreadId && !knownMasters.has(spread.masterSpreadId)) spread.masterSpreadId = null;
   for (const master of masterSpreads) {
     if (master.parentMasterId && !knownMasters.has(master.parentMasterId)) delete master.parentMasterId;
@@ -1389,4 +1488,28 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     if (!frame.prevFrameId && content) { frame.storyContent = structuredClone(content); frame.rawStoryText = storyText(content); reflowStoryState(project, frame.id); }
   }
   return project;
+}
+
+/**
+ * Pages of one InDesign spread can use different parents, while a spread here has one. The spread
+ * takes the parent most of its pages use (the one with artwork on a tie), and the items of that
+ * parent are detached from the pages that use another parent or none, so a chapter opening or an
+ * imprint page stays without the running head it does not have in InDesign.
+ */
+function settlePageMasters(spread: Spread, pageMasters: Map<string, string | null>, masters: Pick<Spread, "id" | "pages" | "elements">[]) {
+  const byPage = spread.pages.map(page => pageMasters.get(page.id) ?? null);
+  if (new Set(byPage).size < 2) return;
+  const artwork = (id: string | null) => masters.find(master => master.id === id)?.elements.length ?? 0;
+  const counts = new Map<string | null, number>();
+  for (const id of byPage) counts.set(id, (counts.get(id) ?? 0) + 1);
+  const chosen = [...counts].sort((a, b) => b[1] - a[1] || artwork(b[0]) - artwork(a[0]))[0][0];
+  spread.masterSpreadId = chosen;
+  const master = masters.find(item => item.id === chosen);
+  if (!master) return;
+  const elsewhere = new Set(spread.pages.filter((_, index) => byPage[index] !== chosen).map(page => page.id));
+  const detached = master.elements.filter(element => {
+    const target = masterTargetPage(master.pages, spread.pages, element.pageId);
+    return target && elsewhere.has(target.id);
+  }).map(element => element.id);
+  if (detached.length) spread.detachedMasterElementIds = [...(spread.detachedMasterElementIds || []), ...detached];
 }
