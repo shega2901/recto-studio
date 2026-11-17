@@ -48,6 +48,8 @@ Vitest explicitly excludes e2e files; `npm test` remains the engine/unit suite.
   composed lines, copy/paste, applying a paragraph style mid-edit, Ctrl+B / Ctrl+I, threaded
   frames reflowing while typing, the view following the caret across spreads, and the textarea
   fallback.
+- Fonts installed on the computer: choosing one for a frame, and finding a missing document
+  font among them (Chromium's Local Font Access, granted for the test).
 
 Remote Google font requests are blocked for deterministic offline checks. Real
 font files are uploaded through the same input used by the user. Assertions use
