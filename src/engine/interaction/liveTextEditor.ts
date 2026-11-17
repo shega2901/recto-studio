@@ -408,6 +408,13 @@ export class LiveTextEditor {
     }
     const apple = /Mac|iPhone|iPad/.test(navigator.platform);
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+    if (event.key === 'Tab' && plain) {
+      // In a text frame Tab is a character, as in InDesign, not a move to the next control.
+      // Shift+Tab (a right-indent tab there) has no equivalent yet; it must not leave the editor either.
+      event.preventDefault();
+      if (!event.shiftKey) this.insertText('\t');
+      return;
+    }
     // By physical key, so the shortcuts work on any keyboard layout.
     const format = ({ KeyB: 'bold', KeyI: 'italic', KeyU: 'underline' } as Record<string, LiveTextFormat>)[event.code];
     if (format && (apple ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && !event.altKey && !event.shiftKey) {
@@ -437,6 +444,14 @@ export class LiveTextEditor {
       handled = this.moveToLineEdge(event.key === 'ArrowRight', event.shiftKey);
     }
     if (handled) event.preventDefault();
+  }
+
+  /** Type `text` at the selection, as the keyboard would: one input event, on the textarea's own undo stack. */
+  private insertText(text: string) {
+    // execCommand is deprecated but still the only way to keep the edit undoable with Ctrl+Z.
+    if (document.execCommand?.('insertText', false, text)) return;
+    this.textarea.setRangeText(text, this.textarea.selectionStart, this.textarea.selectionEnd, 'end');
+    this.textarea.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
   }
 
   private moveVertically(direction: -1 | 1, extend: boolean, page = false): boolean {

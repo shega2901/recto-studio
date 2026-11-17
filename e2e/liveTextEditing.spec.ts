@@ -366,3 +366,25 @@ test('scrolls to the caret and follows the story onto the next spread', async ({
   expect(await story()).toBe(`${expected.slice(0, shown)}NEXT ${expected.slice(shown)}`);
   await page.keyboard.press('Escape');
 });
+
+test('types a tab character instead of leaving the frame', async ({ page }) => {
+  await openStyledProject(page);
+  const point = await bodyLine(page);
+  await page.mouse.dblclick(point.x, point.y);
+  const editor = page.locator('.canvas-inline-editor');
+  await expect(editor).toBeFocused();
+  const at = (await selection(page)).start;
+
+  await page.keyboard.press('Tab');
+  await expect(editor).toBeFocused();
+  expect((await editor.inputValue()).slice(at, at + 1)).toBe('\t');
+  expect(await selection(page)).toMatchObject({ start: at + 1, end: at + 1 });
+  // Shift+Tab has no meaning in a text frame yet, but it must not move focus out of it either.
+  await page.keyboard.press('Shift+Tab');
+  await expect(editor).toBeFocused();
+
+  await page.keyboard.press('Control+Enter');
+  const text = (await frameState(page)).text;
+  expect(text.slice(at, at + 1)).toBe('\t');
+  expect(text.replace('\t', '')).toBe(`${HEADING}\n${BODY}\n${QUOTE}`);
+});
