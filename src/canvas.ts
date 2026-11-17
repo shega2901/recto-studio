@@ -6,7 +6,8 @@ import { formatOpenTypeText, segmentTextWithGrep } from './engine/legacyTypograp
 export { formatOpenTypeText, segmentTextWithGrep, type TextRunSegment } from './engine/legacyTypography';
 import { publicationWrapObjects, wrappedPlainContent } from './engine/publicationWrap';
 export { calculateImageFitting, type ImageFitTransform } from './engine/imageFitting';
-import { layoutFrameNotes, publicationText } from './engine/publicationReferences';
+import { layoutFrameNotes, publicationText, reflowStoryState } from './engine/publicationReferences';
+import type { InlineTextSelection } from './utils/paragraphStyleTarget';
 import { reviewPinPosition } from './engine/reviewPins';
 import { calculateSpreadGeometry, getSpreadScreenOrigin, MM_TO_PX, screenToSpreadMm } from './engine/viewport';
 import { bindCanvasInput, type CanvasMouseDown, type CanvasMouseMove, type CanvasMouseUp } from './engine/interaction/canvasInput';
@@ -38,10 +39,10 @@ import { assetStore } from './engine/assetStore';
 import { tableEngine } from './engine/tableEngine';
 import { tableThread } from './engine/tableCells';
 import { canvasRunFont, layoutStory } from './engine/storyLayout';
-import { indexLines, liveStoryContent, spliceStory, supportsLiveEditing } from './engine/liveTextEditing';
-import { storyText } from './engine/storyContent';
-import { LiveTextEditor, liveTextEditingEnabled, setLiveTextEditingEnabled,
-  type LiveTextBox, type LiveTextComposition, type LiveTextOpenOptions } from './engine/interaction/liveTextEditor';
+import { indexLines, joinStory, liveStoryContent, shiftLines, spliceStory, supportsLiveEditing } from './engine/liveTextEditing';
+import { plainStory, sliceStory } from './engine/storyContent';
+import { LiveTextEditor, liveTextEditingEnabled, setLiveTextEditingEnabled, type LivePart,
+  type LiveTextBase, type LiveTextBox, type LiveTextComposition, type LiveTextOpenOptions } from './engine/interaction/liveTextEditor';
 
 export { MM_TO_PX } from './engine/viewport';
 
@@ -258,13 +259,20 @@ export class SpreadCanvas {
   // Active in-place canvas overlay editor (WordPad/Figma style)
   // `live` is set when the frame is edited in place on the canvas; without it `el` is the visible
   // textarea editor, which stays as the fallback.
-  private activeInlineEditor: { elementId: string; el: HTMLElement; live?: LiveTextEditor; selectionAtOpen?: string } | null = null;
+  private activeInlineEditor: {
+    elementId: string; el: HTMLElement; live?: LiveTextEditor; selectionAtOpen?: string;
+    /** The story's other frames may be rewritten too, so threaded frames on this spread are edited together. */
+    threadEditable?: boolean;
+    tail?: { key: unknown[]; content: StoryContent };
+  } | null = null;
+  /** The in-place editor's composition for the paint in progress; every edited frame draws its part of it. */
+  private liveComposition: LiveTextComposition | null = null;
   /**
    * Selection in the inline editor at the moment it lost focus to the UI (inspector button, Quick Apply,
    * a dropdown). Clicking such a control blurs the textarea and closes the editor before the click fires,
    * so without this a paragraph style would fall back to the whole frame.
    */
-  private rememberedTextSelection: { elementId: string; text: string; start: number; end: number } | null = null;
+  private rememberedTextSelection: { elementId: string; text: string; start: number; end: number; storyStart?: number } | null = null;
 
   // High-performance requestAnimationFrame render coalescing loop
   private renderRafId: number | null = null;
@@ -1617,16 +1625,32 @@ export class SpreadCanvas {
    * Caret / selection in the inline text editor of `elementId`, as offsets into the editor's text.
    * Falls back to the selection remembered when the editor just lost focus to the UI.
    * Returns null when that frame is not being edited, so callers apply to the whole frame.
+   *
+   * Threaded frames edited together share one text, so `text` may hold more than this frame:
+   * `storyStart` is where it begins in the story, and `content` is its formatted content.
    */
-  public getActiveTextSelection(elementId: string): { text: string; start: number; end: number } | null {
+  public getActiveTextSelection(elementId: string): InlineTextSelection | null {
     if (this.activeInlineEditor && this.activeInlineEditor.elementId === elementId) {
       const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
       if (typeof ta.selectionStart !== 'number' || typeof ta.selectionEnd !== 'number') return null;
-      return { text: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
+      const selection: InlineTextSelection = { text: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
+      const live = this.activeInlineEditor.live;
+      const range = live && this.liveTextBase(elementId)?.range;
+      if (live && range) {
+        selection.storyStart = range.start;
+        selection.content = live.content() ?? undefined;
+      }
+      return selection;
     }
     const remembered = this.rememberedTextSelection;
     if (remembered && remembered.elementId === elementId) {
-      return { text: remembered.text, start: remembered.start, end: remembered.end };
+      const selection: InlineTextSelection = { text: remembered.text, start: remembered.start, end: remembered.end };
+      if (remembered.storyStart !== undefined) {
+        // The edit was committed when focus left; read the formatting back from the story.
+        selection.storyStart = remembered.storyStart;
+        selection.content = sliceStory(stateManager.getStoryContent(elementId), remembered.storyStart, remembered.storyStart + remembered.text.length);
+      }
+      return selection;
     }
     return null;
   }
@@ -1634,18 +1658,20 @@ export class SpreadCanvas {
   public closeInlineTextEditor(commit: boolean = true): void {
     if (!this.activeInlineEditor) return;
     const { elementId, el, live } = this.activeInlineEditor;
-    this.activeInlineEditor = null;
     const text = (el as HTMLTextAreaElement | HTMLInputElement).value;
-    const spread = stateManager.getActiveSpread();
-    const currentEl = spread.elements.find((item) => item.id === elementId);
-    const changed = currentEl && currentEl.type === 'text' && (currentEl as TextElement).text !== text;
+    // In-place editing may cover several threaded frames; the textarea editor always covers one.
+    const base = live ? this.liveTextBase(elementId) : null;
     // Take the formatted draft before the editor goes away; it is what the canvas has been showing.
-    const draft = commit && changed && live ? live.content(currentEl as TextElement) : null;
+    const draft = commit && base && base.text !== text ? live!.content() : null;
+    this.activeInlineEditor = null;
     live?.destroy();
     el.remove();
-    if (commit && changed) {
-      if (!draft || !this.commitLiveStory(currentEl as TextElement, draft, text)) {
-        stateManager.updateElement(elementId, { text });
+    const currentEl = stateManager.getActiveSpread().elements.find((item) => item.id === elementId);
+    if (commit && currentEl?.type === 'text' && (base ? base.text : currentEl.text) !== text) {
+      if (!draft || !base?.range || !this.commitLiveStory(elementId, base.range, draft, text)) {
+        // Plain frames, and stories that refuse a content edit (a locked frame elsewhere in the thread).
+        if (!base || base.frames === 1) stateManager.updateElement(elementId, { text });
+        else alert('The text edit could not be saved to this story. Unlock its frames and try again.');
       }
     }
     this.render();
@@ -1654,26 +1680,27 @@ export class SpreadCanvas {
   private openLiveTextEditor(textEl: TextElement, options: LiveTextOpenOptions): void {
     const id = textEl.id;
     const parent = this.canvas.parentElement || this.container;
-    const frame = () => {
-      const current = stateManager.getActiveSpread().elements.find(item => item.id === id);
-      return current?.type === 'text' ? current : null;
+    // Registered first: the editor composes the text while it is being constructed.
+    const active: NonNullable<SpreadCanvas['activeInlineEditor']> = {
+      elementId: id, el: parent, selectionAtOpen: this.selectionKey(), threadEditable: this.storyChainEditable(textEl),
     };
+    this.activeInlineEditor = active;
     const live = new LiveTextEditor({
       parent,
-      frame,
-      compose: (current, value, content) => this.composeLiveText(current, value, content),
+      base: () => this.liveTextBase(id),
+      compose: (value, content) => this.composeLiveText(id, value, content),
       box: current => this.liveTextBox(current),
       requestRender: () => this.scheduleRender(),
       close: (commit, toUi) => {
-        const active = this.activeInlineEditor;
-        if (active?.live !== live) return;
+        if (this.activeInlineEditor?.live !== live) return;
         if (toUi) {
-          this.rememberedTextSelection = { elementId: id, text: live.value, ...live.selection };
+          this.rememberedTextSelection = { elementId: id, text: live.value, ...live.selection, storyStart: this.liveTextBase(id)?.range?.start };
         }
         this.closeInlineTextEditor(commit);
       },
-    }, textEl, this.canvas, options);
-    this.activeInlineEditor = { elementId: id, el: live.textarea, live, selectionAtOpen: this.selectionKey() };
+    }, id, textEl, this.canvas, options);
+    active.el = live.textarea;
+    active.live = live;
     this.render();
   }
 
@@ -1682,33 +1709,164 @@ export class SpreadCanvas {
    * as content: sending only the text would make the document re-derive the formatting from a single
    * before/after comparison and restyle everything between two separate edits.
    */
-  private commitLiveStory(frame: TextElement, draft: StoryContent, text: string): boolean {
+  private commitLiveStory(frameId: string, range: { start: number; end: number }, draft: StoryContent, text: string): boolean {
     try {
-      const story = stateManager.getStoryContent(frame.id);
-      const start = frame.storyStart ?? 0;
-      const end = frame.storyEnd ?? storyText(story).length;
-      stateManager.setStoryContent(frame.id, spliceStory(story, start, end, draft));
+      const story = stateManager.getStoryContent(frameId);
+      stateManager.setStoryContent(frameId, spliceStory(story, range.start, range.end, draft));
     } catch {
       // A locked frame elsewhere in the thread, for one: fall back to the frame-level text edit.
       return false;
     }
-    stateManager.onMutation?.({ type: 'update', elementId: frame.id, updates: { text } as Partial<CanvasElement> });
+    stateManager.onMutation?.({ type: 'update', elementId: frameId, updates: { text } as Partial<CanvasElement> });
     return true;
   }
 
-  /** Lay out the frame as it will look once the editor's text is committed. */
-  private composeLiveText(text: TextElement, value: string, draft?: StoryContent | null): LiveTextComposition {
+  private liveFrame(id: string): TextElement | null {
+    const current = stateManager.getActiveSpread().elements.find(item => item.id === id);
+    return current?.type === 'text' ? current : null;
+  }
+
+  /**
+   * Whether the whole story may be rewritten, as committing content does. With a locked frame or
+   * layer anywhere in the thread, editing stays inside the one frame, as the textarea editor does.
+   */
+  private storyChainEditable(frame: TextElement): boolean {
+    if (!frame.prevFrameId && !frame.nextFrameId) return true;
+    const state = stateManager.getState();
+    const frames = new Map<string, TextElement>();
+    for (const spread of state.spreads) for (const element of spread.elements) if (element.type === 'text') frames.set(element.id, element);
+    const lockedLayers = new Set(state.layers.filter(layer => layer.locked).map(layer => layer.id));
+    const seen = new Set<string>();
+    let head = frame;
+    while (head.prevFrameId && frames.has(head.prevFrameId) && !seen.has(head.id)) { seen.add(head.id); head = frames.get(head.prevFrameId)!; }
+    if (head.generated) return false;
+    seen.clear();
+    for (let current: TextElement | undefined = head; current && !seen.has(current.id);
+      current = current.nextFrameId ? frames.get(current.nextFrameId) : undefined) {
+      seen.add(current.id);
+      if (current.locked || (current.layerId && lockedLayers.has(current.layerId))) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The frames edited together with `frame`: its neighbours in the thread that sit on the same
+   * spread, in reading order. Text flows between them while typing; a frame on another spread
+   * receives its share when the edit is committed.
+   */
+  private liveRun(frame: TextElement): TextElement[] {
+    const threaded = !!(frame.prevFrameId || frame.nextFrameId) && !!frame.textContent;
+    if (!threaded || !this.activeInlineEditor?.threadEditable) return [frame];
+    const frames = new Map<string, TextElement>();
+    for (const element of stateManager.getActiveSpread().elements) if (element.type === 'text' && element.textContent) frames.set(element.id, element);
+    const run = [frame], seen = new Set([frame.id]);
+    for (let previous = frames.get(frame.prevFrameId || ''); previous && !seen.has(previous.id); previous = frames.get(previous.prevFrameId || '')) {
+      seen.add(previous.id); run.unshift(previous);
+    }
+    for (let next = frames.get(frame.nextFrameId || ''); next && !seen.has(next.id); next = frames.get(next.nextFrameId || '')) {
+      seen.add(next.id); run.push(next);
+    }
+    return run;
+  }
+
+  /** The committed text behind the in-place editor of `id`, and where it sits in its story. */
+  private liveTextBase(id: string): (LiveTextBase & { frames: number; range?: { start: number; end: number } }) | null {
+    const frame = this.liveFrame(id);
+    if (!frame) return null;
+    const run = this.liveRun(frame);
+    if (!frame.textContent) return { key: [null], text: frame.text || '', content: () => null, frames: 1 };
+    const first = run[0], last = run[run.length - 1];
+    const text = run.length === 1 ? frame.text || '' : run.map(item => item.text || '').join('');
+    const start = first.storyStart ?? 0;
+    const range = { start, end: last.storyEnd ?? start + text.length };
+    return {
+      key: [...run.map(item => item.textContent), start], text, range, frames: run.length,
+      content: () => run.length === 1 ? frame.textContent! : sliceStory(stateManager.getStoryContent(id), range.start, range.end),
+    };
+  }
+
+  /** Lay out the edited frames as they will look once the editor's text is committed. */
+  private composeLiveText(id: string, value: string, draft: StoryContent | null): LiveTextComposition {
+    const frame = this.liveFrame(id);
+    if (!frame) return { content: draft || plainStory(value), parts: [] };
     const state = stateManager.getState();
     const spread = stateManager.getActiveSpread();
-    const obstacles = publicationWrapObjects(state, spread).filter(other => other.id !== text.id && other.pageId === text.pageId);
-    const content = draft || liveStoryContent(text, value, obstacles.length > 0);
-    const layout = layoutStory(content, text, state.paragraphStyles, state.characterStyles,
-      undefined, layoutFrameNotes(state, text).height, { obstacles, baselineGrid: state.settings.baselineGrid });
-    return {
-      content, lines: layout.lines, overset: layout.overset,
-      live: indexLines(layout.lines, value, content, text, state.paragraphStyles, state.characterStyles),
-      topBaseline: !text.textContent && !obstacles.length,
-    };
+    const wraps = publicationWrapObjects(state, spread);
+    const pageObstacles = (target: TextElement) => wraps.filter(other => other.id !== target.id && other.pageId === target.pageId);
+    const run = this.liveRun(frame);
+    const threaded = !!draft && !!(frame.prevFrameId || frame.nextFrameId) && !!this.activeInlineEditor?.threadEditable;
+
+    if (!threaded) {
+      const obstacles = pageObstacles(frame);
+      const content = draft || liveStoryContent(frame, value, obstacles.length > 0);
+      const layout = layoutStory(content, frame, state.paragraphStyles, state.characterStyles,
+        undefined, layoutFrameNotes(state, frame).height, { obstacles, baselineGrid: state.settings.baselineGrid });
+      return { content, parts: [{
+        frame, lines: layout.lines, overset: layout.overset,
+        live: indexLines(layout.lines, value, content, frame, state.paragraphStyles, state.characterStyles),
+        topBaseline: !frame.textContent && !obstacles.length,
+      }] };
+    }
+
+    // Flow the edited text through copies of the frames with the document's own story reflow, so the
+    // preview breaks from frame to frame exactly where the committed story will.
+    const last = run[run.length - 1];
+    const following = last.nextFrameId ? stateManager.getElementById(last.nextFrameId) : null;
+    const copies = new Map<string, TextElement>();
+    run.forEach((item, index) => {
+      const copy = { ...item };
+      if (index === 0) {
+        // The first copy heads the flow: the edited text, then what the story holds after these frames.
+        delete copy.prevFrameId;
+        delete copy.rawStoryText;
+        copy.storyContent = joinStory(draft, this.liveStoryTail(id, run));
+      }
+      copies.set(item.id, copy);
+    });
+    if (following?.type === 'text') {
+      // One more frame takes whatever is left, so the last edited frame ends where it really will.
+      const rest = { ...following };
+      delete rest.nextFrameId;
+      copies.set(rest.id, rest);
+    }
+    const flow = { ...state, spreads: state.spreads.map(item => item.elements.some(element => copies.has(element.id))
+      ? { ...item, elements: item.elements.map(element => copies.get(element.id) ?? element) } : item) };
+    reflowStoryState(flow, run[0].id);
+
+    return { content: draft, parts: run.map(item => {
+      const copy = copies.get(item.id)!;
+      const content = copy.textContent || plainStory('');
+      const layout = layoutStory(content, copy, state.paragraphStyles, state.characterStyles,
+        undefined, layoutFrameNotes(flow, copy).height, { obstacles: pageObstacles(item), baselineGrid: state.settings.baselineGrid });
+      return {
+        frame: item, lines: layout.lines, overset: layout.overset, topBaseline: false,
+        live: shiftLines(indexLines(layout.lines, copy.text || '', content, copy, state.paragraphStyles, state.characterStyles), copy.storyStart ?? 0),
+      };
+    }) };
+  }
+
+  /**
+   * The story after the edited frames, as far as they could ever show it: deleting text pulls the
+   * following text up into them. Constant during an edit, so it is cut once per committed state.
+   */
+  private liveStoryTail(id: string, run: TextElement[]): StoryContent {
+    const active = this.activeInlineEditor!;
+    const last = run[run.length - 1];
+    const key = [...run.map(item => item.textContent), last.nextFrameId];
+    if (!active.tail || active.tail.key.length !== key.length || active.tail.key.some((item, index) => item !== key[index])) {
+      const start = run[0].storyStart ?? 0, end = last.storyEnd ?? start;
+      // Twice the text they hold now is more than these frames can take; the rest never reaches them.
+      const content = last.nextFrameId
+        ? sliceStory(stateManager.getStoryContent(id), end, end + Math.max(4000, (end - start) * 2)) : plainStory('');
+      active.tail = { key, content };
+    }
+    return active.tail.content;
+  }
+
+  /** Ids of the frames the in-place editor is showing. */
+  private liveRunIds(): Set<string> {
+    const frame = this.activeInlineEditor?.live && this.liveFrame(this.activeInlineEditor.elementId);
+    return new Set(frame ? this.liveRun(frame).map(item => item.id) : []);
   }
 
   private liveTextBox(text: TextElement): LiveTextBox {
@@ -1738,7 +1896,8 @@ export class SpreadCanvas {
     } else if (deselected || state.previewMode || !supportsLiveEditing(current, state.paragraphStyles)) {
       this.closeInlineTextEditor(true);
     } else {
-      active.live.syncWithState(current);
+      active.threadEditable = this.storyChainEditable(current);
+      active.live.syncWithState();
     }
   }
 
@@ -2948,6 +3107,9 @@ export class SpreadCanvas {
 
   public render(proof?: { context: CanvasRenderingContext2D; spot?: string }) {
     if (!proof) this.overflownTextFrameIds.clear();
+    const liveEditor = proof ? undefined : this.activeInlineEditor?.live;
+    const liveFrameIds = liveEditor ? this.liveRunIds() : undefined;
+    this.liveComposition = null;
     const original = stateManager.getState();
     const state = proof ? { ...original, previewMode: true, displayQuality: 'high' as const, selectedElementId: null, selectedElementIds: [] } : original;
     const rect = this.canvas.getBoundingClientRect();
@@ -3173,10 +3335,16 @@ export class SpreadCanvas {
         tableEngine.renderCanvasTable(ctx, table, elScreenX, elScreenY, elScreenW, elScreenH, pxPerMm, state.zoom, tableThread(state.spreads, table));
       } else if (el.type === 'text') {
         const text = el as TextElement;
-        const liveEditor = !proof && this.activeInlineEditor?.elementId === el.id ? this.activeInlineEditor.live : undefined;
         if (!proof && this.activeInlineEditor && this.activeInlineEditor.elementId === el.id && !liveEditor) {
           ctx.restore();
           continue;
+        }
+        // Frames edited in place are composed from the editor's text, not yet committed. Threaded
+        // frames on this spread share one composition, made when the first of them is drawn.
+        let livePart: LivePart | undefined;
+        if (liveEditor && liveFrameIds!.has(el.id) && !inheritedIds.has(el.id)) {
+          this.liveComposition ??= liveEditor.compose();
+          livePart = this.liveComposition.parts.find(part => part.frame.id === el.id);
         }
         if (text.backgroundColor && text.backgroundColor !== 'transparent') {
           ctx.fillStyle = text.backgroundColor;
@@ -3289,17 +3457,15 @@ export class SpreadCanvas {
         }
         const processedText = formatOpenTypeText(rawCleanedText, text.openTypeFeatures);
 
-        // While a frame is edited in place it is composed from the editor's text, not yet committed.
-        const liveComposition = liveEditor?.compose(text);
-        const flowContent = liveComposition?.content || text.textContent || (obstacles.length ? wrappedPlainContent(text, processedText) : undefined);
-        if (flowContent) {
-          const layout = liveComposition || layoutStory(flowContent, text, state.paragraphStyles, state.characterStyles,
+        const flowContent = text.textContent || (obstacles.length ? wrappedPlainContent(text, processedText) : undefined);
+        if (livePart || flowContent) {
+          const layout = livePart || layoutStory(flowContent!, text, state.paragraphStyles, state.characterStyles,
             undefined, totalFootnoteHeightPx / pxPerMm, { obstacles, baselineGrid: state.settings.baselineGrid });
-          if (liveEditor && liveComposition) {
-            liveEditor.paint(ctx, text, liveComposition, { x: elScreenX, y: elScreenY, pxPerMm });
+          if (liveEditor && livePart) {
+            liveEditor.paint(ctx, livePart, { x: elScreenX, y: elScreenY, pxPerMm });
           }
           // A plain frame keeps the legacy renderer's vertical placement while it is being edited.
-          const hangFromTop = !!liveComposition?.topBaseline;
+          const hangFromTop = !!livePart?.topBaseline;
           ctx.textAlign = 'left';
           ctx.textBaseline = hangFromTop ? 'top' : 'alphabetic';
           for (const line of layout.lines) for (const segment of line.segments) {
@@ -3813,6 +3979,8 @@ export class SpreadCanvas {
         }
       }
     }
+    // Every edited frame had its turn; hide the caret if none of them holds it.
+    liveEditor?.finishPaint();
     if (state.previewMode) {
       ctx.restore();
     }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { layoutStory } from '../src/engine/storyLayout';
 import { editStory, sliceStory, storyText } from '../src/engine/storyContent';
-import { applyTextEdit, caretAt, indexLines, lineIndexAt, liveStoryContent, offsetAtPoint, paragraphRangeAt, replayEdits,
+import { applyTextEdit, caretAt, indexLines, joinStory, locateCaret, neighbourLine, shiftLines, lineIndexAt, liveStoryContent, offsetAtPoint, paragraphRangeAt, replayEdits,
   selectionRects, spliceStory, supportsLiveEditing, textEdit, verticalTarget, wordRangeAt } from '../src/engine/liveTextEditing';
 import type { ParagraphStyle, StoryContent, TextElement } from '../src/types';
 
@@ -312,6 +312,52 @@ describe('committing a frame of a threaded story', () => {
 
   it('returns the same story when the frame shows all of it unchanged', () => {
     expect(spliceStory(whole, 0, text.length, whole)).toEqual(whole);
+  });
+});
+
+describe('threaded frames edited together', () => {
+  // Two frames show one text: "aaaa bbbb " and "cccc" in the first, "dd" and "ee" in the second.
+  const first = compose(story(['aaaa bbbb cccc'])).lines;
+  const second = shiftLines(compose(story(['dd'], ['ee'])).lines, 15);
+  const parts = [{ live: first }, { live: [] }, { live: second }];
+
+  it('moves the lines of a later frame to offsets in the shared text', () => {
+    expect(second.map(line => [line.start, line.end, line.next])).toEqual([[15, 17, 18], [18, 20, 20]]);
+    expect(second[0].chunks[0]).toMatchObject({ start: 15, end: 17, text: 'dd', x: 0 });
+    expect(shiftLines(first, 0)).toBe(first);
+  });
+
+  it('finds the frame and line that hold the caret', () => {
+    expect(locateCaret(parts, 12, 'start', measure)).toMatchObject({ part: 0, position: { line: 1, x: 2 } });
+    expect(locateCaret(parts, 16, 'start', measure)).toMatchObject({ part: 2, position: { line: 0, x: 1 } });
+    expect(locateCaret(parts, 20, 'start', measure)).toMatchObject({ part: 2, position: { line: 1, x: 2 } });
+    expect(locateCaret(parts, 40, 'start', measure)).toBeNull();
+  });
+
+  it('lets affinity choose the frame where one ends and the next begins', () => {
+    // Text that wraps from the first frame into the second: offset 14 ends one and starts the other.
+    const wrapped = [{ live: first }, { live: shiftLines(compose(story(['dd'])).lines, 14) }];
+    expect(locateCaret(wrapped, 14, 'end', measure)).toMatchObject({ part: 0, position: { line: 1, x: 4 } });
+    expect(locateCaret(wrapped, 14, 'start', measure)).toMatchObject({ part: 1, position: { line: 0, x: 0 } });
+  });
+
+  it('steps from the last line of a frame to the first line of the next that has text', () => {
+    expect(neighbourLine(parts, 0, 0, 1)).toEqual({ part: 0, line: 1 });
+    expect(neighbourLine(parts, 0, 1, 1)).toEqual({ part: 2, line: 0 });
+    expect(neighbourLine(parts, 2, 0, -1)).toEqual({ part: 0, line: 1 });
+    expect(neighbourLine(parts, 0, 0, -1)).toBeNull();
+    expect(neighbourLine(parts, 2, 1, 1)).toBeNull();
+  });
+
+  it('continues the edited text with the rest of the story', () => {
+    const edited: StoryContent = { version: 1, paragraphs: [{ styleId: 'head', runs: [{ text: 'Title' }] }, { styleId: 'body', runs: [{ text: 'Start of ' }] }] };
+    const rest: StoryContent = { version: 1, paragraphs: [{ styleId: 'body', runs: [{ text: 'a ' }, { text: 'bold', bold: true }] }, { styleId: 'right', runs: [{ text: 'End' }] }] };
+    const joined = joinStory(edited, rest);
+    expect(storyText(joined)).toBe('Title\nStart of a bold\nEnd');
+    expect(joined.paragraphs.map(paragraph => paragraph.styleId)).toEqual(['head', 'body', 'right']);
+    expect(joined.paragraphs[1].runs).toEqual([{ text: 'Start of a ' }, { text: 'bold', bold: true }]);
+    // Nothing after the frames: the edited text is the whole flow.
+    expect(joinStory(edited, { version: 1, paragraphs: [{ runs: [{ text: '' }] }] })).toEqual(edited);
   });
 });
 

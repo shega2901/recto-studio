@@ -5,12 +5,15 @@
  * its own undo), but it is invisible. The canvas draws the frame from the textarea's current value
  * with the document's composer, so each paragraph shows its own style while typing, and this class
  * paints the selection, positions the caret and maps clicks and vertical keys onto the composed lines.
+ *
+ * Threaded frames on the same spread are edited as one text: it reflows from frame to frame on every
+ * keystroke, and the caret and the selection cross from one frame into the next.
  */
 import type { StoryContent, TextElement } from '../../types';
 import type { StoryLine } from '../storyLayout';
-import { editStory, storyText } from '../storyContent';
-import { applyTextEdit, caretAt, lineIndexAt, lineOffsetAt, offsetAtPoint, paragraphRangeAt, replayEdits, selectionRects,
-  textEdit, verticalTarget, wordRangeAt, type CaretAffinity, type LiveLine, type TextEdit } from '../liveTextEditing';
+import { editStory } from '../storyContent';
+import { applyTextEdit, lineOffsetAt, locateCaret, neighbourLine, offsetAtPoint, paragraphRangeAt, replayEdits,
+  selectionRects, textEdit, wordRangeAt, type CaretAffinity, type LiveLine, type TextEdit } from '../liveTextEditing';
 
 const PT = 25.4 / 72;
 const STORAGE_KEY = 'recto.liveTextEditing';
@@ -27,13 +30,29 @@ export function setLiveTextEditingEnabled(enabled: boolean): void {
   } catch { /* Private browsing: the choice lasts for this page only. */ }
 }
 
-export interface LiveTextComposition {
-  content: StoryContent;
+/** One frame of the text being edited: its lines for drawing and for the caret. */
+export interface LivePart {
+  frame: TextElement;
   lines: StoryLine[];
-  overset: boolean;
+  /** The same lines, with offsets in the edited text. Geometry is local to the frame. */
   live: LiveLine[];
+  overset: boolean;
   /** Plain frames hang their text from the top of the line, as the legacy renderer draws them. */
   topBaseline: boolean;
+}
+
+export interface LiveTextComposition {
+  content: StoryContent;
+  parts: LivePart[];
+}
+
+/** The committed text the editor works on: one frame, or the threaded frames edited together. */
+export interface LiveTextBase {
+  /** Identity of what the document currently shows there; differs once the document recomposed it. */
+  key: readonly unknown[];
+  text: string;
+  /** Its formatted content, or null for a plain frame. Only asked for when `key` changes. */
+  content(): StoryContent | null;
 }
 
 /** Frame position on the canvas, in CSS pixels from the canvas corner. */
@@ -41,9 +60,10 @@ export interface LiveTextBox { x: number; y: number; pxPerMm: number }
 
 export interface LiveTextHost {
   parent: HTMLElement;
-  frame(): TextElement | null;
+  /** Null once the frame is gone. */
+  base(): LiveTextBase | null;
   /** `content` is the edited formatted story, or null for a plain frame. */
-  compose(frame: TextElement, value: string, content: StoryContent | null): LiveTextComposition;
+  compose(value: string, content: StoryContent | null): LiveTextComposition;
   box(frame: TextElement): LiveTextBox;
   requestRender(): void;
   /** `toUi` is set when focus moved to a control outside the canvas. */
@@ -58,30 +78,33 @@ export interface LiveTextOpenOptions {
 }
 
 type DragMode = 'character' | 'word' | 'paragraph';
+type Hit = { offset: number; affinity: CaretAffinity };
+
+const sameKey = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((item, index) => item === b[index]);
 
 export class LiveTextEditor {
-  public readonly elementId: string;
   public readonly textarea: HTMLTextAreaElement;
   private readonly caret: HTMLDivElement;
   private readonly lifetime = new AbortController();
   private affinity: CaretAffinity = 'start';
+  /** Horizontal position Up and Down aim for, in canvas pixels, so it carries from frame to frame. */
   private goalX: number | null = null;
   private known = { start: 0, end: 0 };
   private drag: { mode: DragMode; start: number; end: number } | null = null;
   private composed: { value: string; result: LiveTextComposition } | null = null;
   private committedText: string;
-  /** Edits since `committedText`, and the formatted content they produce from the frame's own. */
+  /** Edits since `committedText`, and the formatted content they produce from the document's own. */
   private edits: TextEdit[] = [];
   private lastValue: string;
-  private draft: { base: StoryContent; content: StoryContent; value: string } | null = null;
+  private draft: { key: readonly unknown[]; content: StoryContent | null; value: string } | null = null;
   private compositionStart: number | null = null;
   private caretKey = '';
+  private caretPainted = false;
   private closed = false;
 
-  constructor(private readonly host: LiveTextHost, frame: TextElement, canvas: HTMLCanvasElement,
-    options: LiveTextOpenOptions = {}) {
-    this.elementId = frame.id;
-    this.committedText = this.lastValue = frame.text || '';
+  constructor(private readonly host: LiveTextHost, public readonly elementId: string, frame: TextElement,
+    canvas: HTMLCanvasElement, options: LiveTextOpenOptions = {}) {
+    this.committedText = this.lastValue = host.base()?.text ?? frame.text ?? '';
 
     const textarea = document.createElement('textarea');
     textarea.className = 'canvas-inline-editor canvas-inline-editor--live';
@@ -126,7 +149,7 @@ export class LiveTextEditor {
       this.select(Math.min(options.selection.start, length), Math.min(options.selection.end, length));
     } else if (options.point) {
       const bounds = canvas.getBoundingClientRect();
-      const hit = this.hit(frame, options.point.clientX - bounds.left, options.point.clientY - bounds.top);
+      const hit = this.hit(options.point.clientX - bounds.left, options.point.clientY - bounds.top);
       this.select(hit?.offset ?? length, hit?.offset ?? length, hit?.affinity);
     } else {
       this.select(0, length);
@@ -137,7 +160,6 @@ export class LiveTextEditor {
   public get selection(): { start: number; end: number } {
     return { start: this.textarea.selectionStart, end: this.textarea.selectionEnd };
   }
-  public get dragging(): boolean { return this.drag !== null; }
 
   /** The end of the selection that moves; the anchor is the end that stays. */
   private get focusOffset(): number {
@@ -173,48 +195,68 @@ export class LiveTextEditor {
     const edit = textEdit(this.lastValue, value, this.textarea.selectionEnd);
     this.edits.push(edit);
     this.lastValue = value;
-    const base = this.host.frame()?.textContent;
-    if (this.draft && this.draft.base === base) {
-      this.draft = { base, value, content: applyTextEdit(this.draft.content, edit) };
+    const base = this.host.base();
+    if (this.draft?.content && base && sameKey(this.draft.key, base.key)) {
+      this.draft = { key: this.draft.key, value, content: applyTextEdit(this.draft.content, edit) };
     }
   }
 
   /**
-   * The frame's formatted content with this session's edits applied, or null for a plain frame.
+   * The formatted content with this session's edits applied, or null for a plain frame.
    * Paragraph styles and character formatting outside each edit are exactly the document's.
    */
-  public content(frame: TextElement): StoryContent | null {
-    const base = frame.textContent;
-    if (!base) { this.draft = null; return null; }
+  public content(): StoryContent | null {
+    const base = this.host.base();
+    if (!base) return this.draft?.content ?? null;
     const value = this.textarea.value;
-    if (this.draft?.base === base) {
-      if (this.draft.value !== value) this.draft = { base, value, content: editStory(this.draft.content, value) };
-    } else if (storyText(base) === this.committedText) {
-      // The document recomposed this frame (or the session just began): replay our edits on its content.
-      this.draft = { base, value, content: replayEdits(base, this.edits) };
-    } else {
-      this.draft = { base, value, content: editStory(base, value) };
+    if (this.draft && sameKey(this.draft.key, base.key)) {
+      if (this.draft.content && this.draft.value !== value) {
+        this.draft = { key: base.key, value, content: editStory(this.draft.content, value) };
+      }
+      return this.draft.content;
     }
+    const content = base.content();
+    // The document recomposed these frames (or the session just began): replay our edits on its content.
+    this.draft = { key: base.key, value, content: !content ? null
+      : base.text === this.committedText ? replayEdits(content, this.edits) : editStory(content, value) };
     return this.draft.content;
   }
 
-  /** Compose the frame from the current text. The canvas calls this on every paint. */
-  public compose(frame: TextElement): LiveTextComposition {
+  /** Compose the edited frames from the current text. The canvas calls this once per paint. */
+  public compose(): LiveTextComposition {
     const value = this.textarea.value;
-    const result = this.host.compose(frame, value, this.content(frame));
+    const result = this.host.compose(value, this.content());
     this.composed = { value, result };
+    this.caretPainted = false;
     return result;
   }
 
-  /** Lines for input handling: reuse the last paint unless the text changed since. */
-  private lines(frame: TextElement): LiveLine[] {
-    if (this.composed?.value === this.textarea.value) return this.composed.result.live;
-    return this.compose(frame).live;
+  /** Composition for input handling: reuse the last paint unless the text changed since. */
+  private current(): LiveTextComposition {
+    return this.composed?.value === this.textarea.value ? this.composed.result : this.compose();
   }
 
-  private hit(frame: TextElement, canvasX: number, canvasY: number) {
-    const box = this.host.box(frame);
-    return offsetAtPoint(this.lines(frame), frame, (canvasX - box.x) / box.pxPerMm, (canvasY - box.y) / box.pxPerMm);
+  /** The frame under a canvas point; with `nearest`, the closest one when the point is outside them all. */
+  private partAt(canvasX: number, canvasY: number, nearest: boolean) {
+    let best: { part: LivePart; x: number; y: number } | null = null, distance = Infinity;
+    for (const part of this.current().parts) {
+      const box = this.host.box(part.frame);
+      const x = (canvasX - box.x) / box.pxPerMm, y = (canvasY - box.y) / box.pxPerMm;
+      const gap = Math.hypot(Math.max(0, -x, x - part.frame.width), Math.max(0, -y, y - part.frame.height));
+      if (gap === 0) return { part, x, y };
+      if (nearest && gap < distance) { distance = gap; best = { part, x, y }; }
+    }
+    return best;
+  }
+
+  private hit(canvasX: number, canvasY: number, nearest = false): Hit | null {
+    const target = this.partAt(canvasX, canvasY, nearest);
+    if (!target) return null;
+    const length = this.textarea.value.length;
+    const found = offsetAtPoint(target.part.live, target.part.frame, target.x, target.y);
+    // A frame the text does not reach, or text that belongs to frames further on: the end of ours.
+    if (!found || found.offset > length) return { offset: length, affinity: 'start' };
+    return found;
   }
 
   private place(frame: TextElement, box: LiveTextBox) {
@@ -233,15 +275,19 @@ export class LiveTextEditor {
     style.height = `${height}px`;
   }
 
-  /** Paint the selection under the text and move the caret. Called by the canvas before it draws the lines. */
-  public paint(ctx: CanvasRenderingContext2D, frame: TextElement, composition: LiveTextComposition, box: LiveTextBox) {
-    this.place(frame, box);
+  /**
+   * Paint one frame's share of the selection under its text, and the caret if it is in this frame.
+   * Called by the canvas before it draws that frame's lines.
+   */
+  public paint(ctx: CanvasRenderingContext2D, part: LivePart, box: LiveTextBox) {
+    const frame = part.frame;
+    if (frame.id === this.elementId) this.place(frame, box);
     const { start, end } = this.selection;
     const focused = document.activeElement === this.textarea;
     if (end > start) {
       ctx.save();
       ctx.fillStyle = focused ? 'rgba(13, 153, 255, 0.32)' : 'rgba(128, 128, 128, 0.3)';
-      for (const rect of selectionRects(composition.live, start, end)) {
+      for (const rect of selectionRects(part.live, start, end)) {
         ctx.fillRect(box.x + rect.x * box.pxPerMm, box.y + rect.y * box.pxPerMm, rect.width * box.pxPerMm, rect.height * box.pxPerMm);
       }
       ctx.restore();
@@ -250,23 +296,23 @@ export class LiveTextEditor {
       // Mark text an input method is still composing, as a native field would.
       ctx.save();
       ctx.fillStyle = frame.color || '#111111';
-      for (const rect of selectionRects(composition.live, this.compositionStart, end)) {
+      for (const rect of selectionRects(part.live, this.compositionStart, end)) {
         ctx.fillRect(box.x + rect.x * box.pxPerMm, box.y + (rect.y + rect.height) * box.pxPerMm - 2, rect.width * box.pxPerMm, 1);
       }
       ctx.restore();
     }
 
-    const position = focused && start === end ? caretAt(composition.live, this.focusOffset, this.affinity) : null;
-    const size = position ? position.fontSizePt * PT : 0;
+    const parts = this.composed?.result.parts;
+    const located = parts && focused && start === end ? locateCaret(parts, this.focusOffset, this.affinity) : null;
+    if (!located || parts![located.part] !== part) return;
+    const position = located.position;
+    const size = position.fontSizePt * PT;
     // Story text sits on a baseline one type size below the line top; plain text hangs from the top.
-    const top = position ? position.y + size * (composition.topBaseline ? 0 : 0.15) : 0;
-    if (!position || top + size < 0 || top > frame.height) {
-      this.caret.style.display = 'none';
-      this.caretKey = '';
-      return;
-    }
+    const top = position.y + size * (part.topBaseline ? 0 : 0.15);
+    if (top + size < 0 || top > frame.height) return;
     const left = box.x + position.x * box.pxPerMm, y = box.y + top * box.pxPerMm, height = size * 1.12 * box.pxPerMm;
     const key = `${left.toFixed(1)}:${y.toFixed(1)}:${height.toFixed(1)}`;
+    this.caretPainted = true;
     this.caret.style.display = 'block';
     this.caret.style.left = `${left - 0.75}px`;
     this.caret.style.top = `${y}px`;
@@ -279,6 +325,13 @@ export class LiveTextEditor {
       void this.caret.offsetWidth;
       this.caret.style.animation = '';
     }
+  }
+
+  /** After every edited frame was painted: no frame showed the caret (a range, no focus, overset text). */
+  public finishPaint() {
+    if (this.caretPainted) return;
+    this.caret.style.display = 'none';
+    this.caretKey = '';
   }
 
   /** Where the caret is drawn, in canvas CSS pixels. For tests and tooling. */
@@ -300,60 +353,61 @@ export class LiveTextEditor {
       this.host.close(true);
       return;
     }
-    const frame = this.host.frame();
-    if (!frame) return;
     const apple = /Mac|iPhone|iPad/.test(navigator.platform);
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
     let handled = false;
     // The textarea wraps its own text differently from the page, so anything line-based is ours.
     if (plain && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
-      handled = this.moveVertically(frame, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey);
+      handled = this.moveVertically(event.key === 'ArrowUp' ? -1 : 1, event.shiftKey);
     } else if (plain && (event.key === 'PageUp' || event.key === 'PageDown')) {
-      handled = this.moveVertically(frame, event.key === 'PageUp' ? -1 : 1, event.shiftKey, true);
+      handled = this.moveVertically(event.key === 'PageUp' ? -1 : 1, event.shiftKey, true);
     } else if (plain && (event.key === 'Home' || event.key === 'End')) {
-      handled = this.moveToLineEdge(frame, event.key === 'End', event.shiftKey);
+      handled = this.moveToLineEdge(event.key === 'End', event.shiftKey);
     } else if (apple && event.metaKey && !event.ctrlKey && !event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
-      handled = this.moveToLineEdge(frame, event.key === 'ArrowRight', event.shiftKey);
+      handled = this.moveToLineEdge(event.key === 'ArrowRight', event.shiftKey);
     }
     if (handled) event.preventDefault();
   }
 
-  private moveVertically(frame: TextElement, direction: -1 | 1, extend: boolean, page = false): boolean {
-    const lines = this.lines(frame);
-    const position = caretAt(lines, this.focusOffset, this.affinity);
+  private moveVertically(direction: -1 | 1, extend: boolean, page = false): boolean {
+    const parts = this.current().parts;
+    const located = locateCaret(parts, this.focusOffset, this.affinity);
     // An overset caret has no line to move from; let the textarea handle the key.
-    if (!position) return false;
-    const goal = this.goalX ?? position.x;
-    let edge = position.line;
+    if (!located) return false;
+    const length = this.textarea.value.length;
+    const from = this.host.box(parts[located.part].frame);
+    const goal = this.goalX ?? from.x + located.position.x * from.pxPerMm;
+    let target: { part: number; line: number } | null = { part: located.part, line: located.position.line };
     // Page keys travel to the first or last line of the column the caret is in.
-    while (page && lines[edge + direction]?.column === lines[position.line].column) edge += direction;
-    const target = edge !== position.line ? lineOffsetAt(lines[edge], goal)
-      : verticalTarget(lines, position.line, direction, goal, this.textarea.value.length);
-    this.select(extend ? this.anchorOffset : target.offset, target.offset, target.affinity);
+    const lines = parts[located.part].live;
+    while (page && lines[target.line + direction]?.column === lines[located.position.line].column) target.line += direction;
+    if (target.line === located.position.line) target = neighbourLine(parts, located.part, located.position.line, direction);
+    let hit: Hit = { offset: direction < 0 ? 0 : length, affinity: 'start' };
+    if (target) {
+      const box = this.host.box(parts[target.part].frame);
+      hit = lineOffsetAt(parts[target.part].live[target.line], (goal - box.x) / box.pxPerMm);
+      if (hit.offset > length) hit = { offset: length, affinity: 'start' };
+    }
+    this.select(extend ? this.anchorOffset : hit.offset, hit.offset, hit.affinity);
     this.goalX = goal;
     return true;
   }
 
-  private moveToLineEdge(frame: TextElement, end: boolean, extend: boolean): boolean {
-    const lines = this.lines(frame);
-    const index = lineIndexAt(lines, this.focusOffset, this.affinity);
-    if (index === -1) return false;
-    const line = lines[index];
-    const offset = end ? line.end : line.start;
+  private moveToLineEdge(end: boolean, extend: boolean): boolean {
+    const parts = this.current().parts;
+    const located = locateCaret(parts, this.focusOffset, this.affinity);
+    if (!located) return false;
+    const line = parts[located.part].live[located.position.line];
+    const offset = Math.min(end ? line.end : line.start, this.textarea.value.length);
     this.goalX = null;
     this.select(extend ? this.anchorOffset : offset, offset, end && !line.hard ? 'end' : 'start');
     return true;
   }
 
-  /** A press on the canvas. Returns false when it missed the frame, so the canvas handles it. */
+  /** A press on the canvas. Returns false when it missed the edited frames, so the canvas handles it. */
   public pointerDown(canvasX: number, canvasY: number, event: { shiftKey?: boolean; detail?: number }): boolean {
-    const frame = this.host.frame();
-    if (!frame) return false;
-    const box = this.host.box(frame);
-    const x = (canvasX - box.x) / box.pxPerMm, y = (canvasY - box.y) / box.pxPerMm;
-    if (x < 0 || y < 0 || x > frame.width || y > frame.height) return false;
-    const hit = this.hit(frame, canvasX, canvasY);
-    if (!hit) return true;
+    const hit = this.hit(canvasX, canvasY);
+    if (!hit) return false;
     const clicks = event.detail || 1;
     const text = this.textarea.value;
     this.goalX = null;
@@ -374,14 +428,12 @@ export class LiveTextEditor {
     return true;
   }
 
-  /** Pointer movement. Extends a drag selection; reports whether the pointer is over the frame's text. */
+  /** Pointer movement. Extends a drag selection; reports whether the pointer is over an edited frame. */
   public pointerMove(canvasX: number, canvasY: number, buttons?: number): 'drag' | 'over' | null {
-    const frame = this.host.frame();
-    if (!frame) return null;
     // The button was released where no mouseup reached us (outside the window): the drag is over.
     if (buttons === 0) this.drag = null;
     if (this.drag) {
-      const hit = this.hit(frame, canvasX, canvasY);
+      const hit = this.hit(canvasX, canvasY, true);
       if (hit) {
         const text = this.textarea.value;
         const range = this.drag.mode === 'word' ? wordRangeAt(text, hit.offset)
@@ -392,9 +444,7 @@ export class LiveTextEditor {
       }
       return 'drag';
     }
-    const box = this.host.box(frame);
-    const x = (canvasX - box.x) / box.pxPerMm, y = (canvasY - box.y) / box.pxPerMm;
-    return x >= 0 && y >= 0 && x <= frame.width && y <= frame.height ? 'over' : null;
+    return this.partAt(canvasX, canvasY, false) ? 'over' : null;
   }
 
   public pointerUp(): boolean {
@@ -404,11 +454,11 @@ export class LiveTextEditor {
   }
 
   /** Follow text changes made elsewhere (inspector, reflow, collaborators) while nothing is pending here. */
-  public syncWithState(frame: TextElement) {
-    // The frame, its styles or its neighbours may have changed: compose afresh for the next input.
+  public syncWithState() {
+    // The frames, their styles or their neighbours may have changed: compose afresh for the next input.
     this.composed = null;
-    const current = frame.text || '';
-    if (current === this.committedText) return;
+    const current = this.host.base()?.text;
+    if (current === undefined || current === this.committedText) return;
     if (this.textarea.value === this.committedText) {
       const { selectionStart, selectionEnd, selectionDirection } = this.textarea;
       this.textarea.value = current;

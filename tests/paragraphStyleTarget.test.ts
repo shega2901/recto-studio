@@ -186,6 +186,17 @@ describe('activeParagraphStyleId (ACTIVE badge target)', () => {
     expect(activeParagraphStyleId(el, null)).toBe('style-body');
   });
 
+  it('reads the paragraphs the editor supplies when it edits several threaded frames', () => {
+    // The editor was opened on the second frame of a thread; its text also holds the first frame's.
+    const second = { paragraphStyleId: 'style-body', textContent: { paragraphs: [{ styleId: 'style-pullquote' }] } };
+    const shared = { paragraphs: [{ styleId: 'style-h1' }, { styleId: undefined }, { styleId: 'style-pullquote' }] };
+    const across = (start: number, end: number = start) => ({ text, start, end, storyStart: 0, content: shared });
+    expect(activeParagraphStyleId(second, across(3))).toBe('style-h1');
+    expect(activeParagraphStyleId(second, across(10))).toBe('style-body');
+    expect(activeParagraphStyleId(second, across(text.length))).toBe('style-pullquote');
+    expect(activeParagraphStyleId(second, across(3, 10))).toBeUndefined();
+  });
+
   it('uses the frame style for a frame with no per-paragraph content', () => {
     expect(activeParagraphStyleId({ paragraphStyleId: 'style-body' }, sel(3))).toBe('style-body');
   });

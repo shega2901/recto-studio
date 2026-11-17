@@ -34,6 +34,19 @@ interface StyledParagraphs {
 }
 
 /**
+ * Caret or selection in the inline text editor. Threaded frames on one spread are edited together,
+ * so `text` can hold more than the frame the editor was opened on: `storyStart` is then where that
+ * text begins in the story, and `content` its paragraphs as the editor currently has them.
+ */
+export interface InlineTextSelection {
+  text: string;
+  start: number;
+  end: number;
+  storyStart?: number;
+  content?: StyledParagraphs;
+}
+
+/**
  * The paragraph style to highlight as "active" in the Styles panel for a text frame.
  *
  * While the frame is being edited, it is the style of the paragraph(s) the caret/selection touches
@@ -43,9 +56,10 @@ interface StyledParagraphs {
  */
 export function activeParagraphStyleId(
   el: { paragraphStyleId?: string; textContent?: StyledParagraphs; storyContent?: StyledParagraphs },
-  selection: { text: string; start: number; end: number } | null,
+  selection: InlineTextSelection | null,
 ): string | undefined {
-  const content = el.textContent ?? el.storyContent;
+  // The editor's own paragraphs when it supplies them: they match its text even before a commit.
+  const content = selection?.content ?? el.textContent ?? el.storyContent;
   if (!selection || !content) return el.paragraphStyleId;
 
   const indices = paragraphIndicesForRange(selection.text, selection.start, selection.end);

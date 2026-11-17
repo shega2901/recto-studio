@@ -38,7 +38,7 @@ async function openStyledProject(page: Page) {
 }
 
 /** Client coordinates of a point given in millimetres from the frame's corner. */
-function framePoint(page: Page, xMm: number, yMm: number) {
+function framePoint(page: Page, xMm: number, yMm: number, id = FRAME) {
   return page.evaluate(([id, xMm, yMm]) => {
     const { stateManager } = (window as any).recto;
     const canvas = document.querySelector('#spread-canvas')!.getBoundingClientRect();
@@ -49,7 +49,7 @@ function framePoint(page: Page, xMm: number, yMm: number) {
       x: canvas.left + (canvas.width - state.settings.widthMm * scale) / 2 + state.panX + (frame.x + xMm) * scale,
       y: canvas.top + (canvas.height - state.settings.heightMm * scale) / 2 + state.panY + (frame.y + yMm) * scale,
     };
-  }, [FRAME, xMm, yMm] as const);
+  }, [id, xMm, yMm] as const);
 }
 
 function frameState(page: Page) {
@@ -202,4 +202,75 @@ test('keeps the textarea editor as the fallback when in-place editing is off', a
   await page.keyboard.press('Control+Enter');
   await expect(editor).toHaveCount(0);
   expect((await frameState(page)).text).toBe(`${HEADING}\n${BODY}\n${QUOTE} (old editor)`);
+});
+
+test('reflows threaded frames while typing and lets the caret cross between them', async ({ page }) => {
+  const project = styledProject();
+  const [first] = project.spreads[0].elements;
+  const { storyContent: _story, ...frame } = first;
+  // The same story in two linked frames side by side; the first holds the heading and a few lines.
+  const linked = { ...project, spreads: [{ ...project.spreads[0], elements: [
+    { ...first, width: 70, height: 45, nextFrameId: 'text-next' },
+    { ...frame, id: 'text-next', x: 105, width: 80, height: 110, prevFrameId: FRAME },
+  ] }] };
+  await page.route(/fonts\.(googleapis|gstatic)\.com/, route => route.abort());
+  await page.goto('/');
+  await importProject(page, linked as unknown as ReturnType<typeof projectFixture>);
+
+  const texts = () => page.evaluate(ids => ids.map(id => (window as any).recto.stateManager.getElementById(id).text as string), [FRAME, 'text-next']);
+  const within = async (id: string) => {
+    const [corner, far, at] = [await framePoint(page, 0, 0, id), await framePoint(page, 80, 110, id), (await caret(page))!];
+    return at.x >= corner.x && at.x <= far.x && at.y >= corner.y && at.y <= far.y;
+  };
+  const before = await texts();
+  expect(before[0].length).toBeGreaterThan(40);
+  expect(before[1].length).toBeGreaterThan(40);
+  expect(before.join('')).toBe(`${HEADING}\n${BODY}\n${QUOTE}`);
+
+  // The heading takes two lines in the narrow frame; this is the first line of the body below it.
+  const point = await framePoint(page, 30, 28);
+  await page.mouse.dblclick(point.x, point.y);
+  const editor = page.locator('.canvas-inline-editor');
+  await expect(editor).toBeFocused();
+  // Both frames are edited as one text.
+  await expect(editor).toHaveValue(before.join(''));
+  expect(await within(FRAME)).toBe(true);
+
+  // The end of the story is in the second frame, and so is the caret when it goes there.
+  await page.keyboard.press('Control+End');
+  expect(await within('text-next')).toBe(true);
+  const endBefore = (await caret(page))!;
+
+  // Text typed in the first frame pushes the rest down the second one at once.
+  await page.mouse.click(point.x, point.y);
+  await page.keyboard.press('Home');
+  expect((await selection(page)).start).toBe(HEADING.length + 1);
+  const inserted = 'Вставка сдвигает текст во второй блок сразу, пока идёт набор. '.repeat(2);
+  await page.keyboard.type(inserted);
+  expect(await texts()).toEqual(before);
+  await page.keyboard.press('Control+End');
+  const endTyping = (await caret(page))!;
+  expect(endTyping.y).toBeGreaterThan(endBefore.y + 10);
+
+  // Walking right from the last line of the first frame arrives in the second.
+  await page.keyboard.press('Control+Home');
+  for (let line = 0; line < 12 && await within(FRAME); line++) await page.keyboard.press('ArrowDown');
+  expect(await within('text-next')).toBe(true);
+  await page.keyboard.press('ArrowUp');
+  expect(await within(FRAME)).toBe(true);
+
+  // Committing changes nothing on the page: the frames already break where the story does.
+  await page.keyboard.press('Control+Enter');
+  await expect(editor).toHaveCount(0);
+  const after = await texts();
+  expect(after.join('')).toBe(`${HEADING}\n${inserted}${BODY}\n${QUOTE}`);
+  expect(after[0].length).toBeLessThan(before[0].length + inserted.length);
+  expect(await page.evaluate(id => (window as any).recto.stateManager.getStoryContent(id).paragraphs.map((paragraph: { styleId?: string }) => paragraph.styleId), FRAME))
+    .toEqual(['ps-head', 'ps-body', 'ps-quote']);
+  await page.mouse.dblclick(point.x, point.y);
+  await expect(editor).toBeFocused();
+  await page.keyboard.press('Control+End');
+  const endCommitted = (await caret(page))!;
+  expect(Math.abs(endCommitted.x - endTyping.x)).toBeLessThan(1);
+  expect(Math.abs(endCommitted.y - endTyping.y)).toBeLessThan(1);
 });

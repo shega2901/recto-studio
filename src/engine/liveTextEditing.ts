@@ -104,6 +104,13 @@ export function spliceStory(content: StoryContent, start: number, end: number, r
   return { version: 1, paragraphs: [...before.slice(0, -1), ...middle, ...after.slice(1)] };
 }
 
+/** `first` followed by `rest`, where `rest` continues the last paragraph of `first`. */
+export function joinStory(first: StoryContent, rest: StoryContent): StoryContent {
+  const last = first.paragraphs[first.paragraphs.length - 1];
+  const joined = { ...last, runs: compactRuns([...last.runs, ...rest.paragraphs[0].runs]) };
+  return { version: 1, paragraphs: [...first.paragraphs.slice(0, -1), joined, ...rest.paragraphs.slice(1)] };
+}
+
 /** One contiguous replacement, as a single input event makes. */
 export interface TextEdit { start: number; removed: number; inserted: string }
 
@@ -221,6 +228,44 @@ export function indexLines(lines: StoryLine[], source: string, content: StoryCon
       color: chunks[0]?.style.color ?? base.color,
     };
   });
+}
+
+/** Move lines composed from a frame's own text to offsets in the text being edited. */
+export function shiftLines(lines: LiveLine[], offset: number): LiveLine[] {
+  if (!offset) return lines;
+  return lines.map(line => ({
+    ...line, start: line.start + offset, end: line.end + offset, next: line.next + offset,
+    chunks: line.chunks.map(chunk => ({ ...chunk, start: chunk.start + offset, end: chunk.end + offset })),
+  }));
+}
+
+/**
+ * Threaded frames that are edited together each contribute a part: their lines, in the offsets of
+ * the shared text. Geometry stays local to each frame.
+ */
+export interface LineGroup { live: LiveLine[] }
+
+/** The frame and line that show a caret at `offset`. Where one frame ends and the next begins, affinity decides. */
+export function locateCaret(parts: LineGroup[], offset: number, affinity: CaretAffinity = 'start',
+  measure: StoryMeasure = measureStoryText): { part: number; position: CaretPosition } | null {
+  let found: { part: number; position: CaretPosition } | null = null;
+  for (let part = 0; part < parts.length; part++) {
+    const position = caretAt(parts[part].live, offset, affinity, measure);
+    if (!position) continue;
+    if (affinity === 'end') return { part, position };
+    found = { part, position };
+  }
+  return found;
+}
+
+/** The line above or below, continuing into the previous or next frame that has any lines. */
+export function neighbourLine(parts: LineGroup[], part: number, line: number, direction: -1 | 1): { part: number; line: number } | null {
+  if (parts[part]?.live[line + direction]) return { part, line: line + direction };
+  for (let next = part + direction; next >= 0 && next < parts.length; next += direction) {
+    const count = parts[next].live.length;
+    if (count) return { part: next, line: direction > 0 ? 0 : count - 1 };
+  }
+  return null;
 }
 
 function advance(text: string, style: RunStyle, measure: StoryMeasure): number {
