@@ -45,6 +45,8 @@ Vitest explicitly excludes e2e files; `npm test` remains the engine/unit suite.
 - Startup resource sizes and absence of deferred tools, with diagnostic timing logs.
 - Placing a layered PSD through the image picker, with the Photoshop reader loaded on demand.
 - Responsive inspector opening/closing at a 390px viewport.
+- In-place text editing with real clicks and keys: styled paragraphs, caret and selection by
+  composed lines, copy/paste, applying a paragraph style mid-edit, and the textarea fallback.
 
 Remote Google font requests are blocked for deterministic offline checks. Real
 font files are uploaded through the same input used by the user. Assertions use
