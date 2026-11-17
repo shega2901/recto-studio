@@ -49,3 +49,9 @@ export function cjkRunTokens(runs: StoryRun[], measure: (text: string, run: Stor
   }
   return tokens;
 }
+
+/**
+ * Words and the spaces between them. Non-breaking spaces (U+00A0, U+202F, U+2007) belong to the
+ * words they join, so a line never breaks there; every other space is a break opportunity.
+ */
+export const BREAKABLE_TOKENS = /[^\S\n\u00a0\u202f\u2007]+|\n|(?:[^\s]|[\u00a0\u202f\u2007])+/gu;

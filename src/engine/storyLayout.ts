@@ -1,7 +1,7 @@
 import type { CanvasElement, CharacterStyle, ParagraphStyle, StoryContent, StoryParagraph, StoryRun, TextElement, TextFormatting } from '../types';
 import { fontManager } from '../fontManager';
 import { hyphenateLanguage } from './languageHyphenation';
-import { cjkRunTokens, graphemes } from './globalTypography';
+import { BREAKABLE_TOKENS, cjkRunTokens, graphemes } from './globalTypography';
 import { prepareWrapObstacles, availableTextInterval } from './wrapGeometry';
 import { layoutKernels } from './layoutRuntime';
 
@@ -126,9 +126,21 @@ function composeStory(paragraphs: StoryParagraphs, frame: TextElement, styles: P
       const first = lineText.trimStart()[0], lastCharacter = lineText.trimEnd().at(-1);
       const leadingHang = frame.opticalMarginAlignment && first && '“‘"\'«‹(['.includes(first) ? measure(first, segments[0].style) / 2 : 0;
       const trailingHang = frame.opticalMarginAlignment && lastCharacter && '.,-–—:;”’"\'»›!?)]'.includes(lastCharacter) ? measure(lastCharacter, segments.at(-1)!.style) / 2 : 0;
-      let shift = alignment === 'right' ? availableWidth - lineWidth + trailingHang : alignment === 'center' ? (availableWidth - lineWidth - leadingHang + trailingHang) / 2 : -leadingHang;
-      const spaces = segments.reduce((n, s) => n + (s.text.match(/ /g)?.length || 0), 0);
-      const extra = alignment === 'justify' && !last && spaces ? Math.max(0, availableWidth - lineWidth + leadingHang + trailingHang) / spaces : 0;
+      // Spaces at the end of a line hang past the margin, as in InDesign: they neither count towards
+      // the width that is aligned nor take a share of the justification.
+      let hanging = 0, hangingSpaces = 0;
+      for (let index = segments.length - 1; index >= 0; index--) {
+        const tail = segments[index].text.match(/\s+$/)?.[0] || '';
+        if (!tail) break;
+        hangingSpaces += tail.match(/ /g)?.length || 0;
+        hanging += tail.length === segments[index].text.length ? segments[index].width
+          : measure(tail, segments[index].style) + Array.from(tail).length * segments[index].style.letterSpacingPt * PT;
+        if (tail.length !== segments[index].text.length) break;
+      }
+      const visibleWidth = lineWidth - hanging;
+      let shift = alignment === 'right' ? availableWidth - visibleWidth + trailingHang : alignment === 'center' ? (availableWidth - visibleWidth - leadingHang + trailingHang) / 2 : -leadingHang;
+      const spaces = segments.reduce((n, s) => n + (s.text.match(/ /g)?.length || 0), 0) - hangingSpaces;
+      const extra = alignment === 'justify' && !last && spaces > 0 ? Math.max(0, availableWidth - visibleWidth + leadingHang + trailingHang) / spaces : 0;
       const positioned: StorySegment[] = [];
       for (const segment of segments) {
         // Split at spaces for explicit justification, shared by canvas and PDF.
@@ -159,9 +171,12 @@ function composeStory(paragraphs: StoryParagraphs, frame: TextElement, styles: P
         const left = frame.x + padding + (index + column) * (width + gutter);
         return left + width - left;
       });
-      const plan = layoutKernels.uniformLines(plainRun.text,
+      const native = layoutKernels.uniformLines(plainRun.text,
         word => measure(word, runStyle) + Array.from(word).length * runStyle.letterSpacingPt * PT,
         widths, y, padding, bottom, height);
+      // The native kernel starts a line with a space that did not fit, and counts it on that line.
+      // Here such a space hangs at the end of the line above, so those paragraphs are composed below.
+      const plan = native && !native.starts.some(start => /^\s+$/u.test(native.words[start])) ? native : undefined;
       if (plan) {
         const { words, advances, starts } = plan;
         let next = 0;
@@ -193,7 +208,7 @@ function composeStory(paragraphs: StoryParagraphs, frame: TextElement, styles: P
       if (run.noteId) runStyle.fontSizePt *= 0.7;
       const renderedText = run.noteId ? item.text.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g, digit => String('⁰¹²³⁴⁵⁶⁷⁸⁹'.indexOf(digit))) : item.text;
       // Keep ordinary words together; split overlong tokens by Unicode code point.
-      for (let token of cjk ? [renderedText] : renderedText.match(/[^\S\n]+|\n|[^\s]+/gu) || []) {
+      for (let token of cjk ? [renderedText] : renderedText.match(BREAKABLE_TOKENS) || []) {
         if (!prepare()) return { lines, consumed, overset: true };
         if (cjk && item.groupWidth !== undefined && token !== '\n') {
           if (lineWidth && lineWidth + item.groupWidth > availableWidth + 0.0001) {
@@ -237,11 +252,13 @@ function composeStory(paragraphs: StoryParagraphs, frame: TextElement, styles: P
         for (const part of parts) {
           if (!prepare()) return { lines, consumed, overset: true };
           const w = measure(part, runStyle) + Array.from(part).length * runStyle.letterSpacingPt * PT;
-          if (!cjk && lineWidth && lineWidth + w > availableWidth + 0.0001) {
+          // A space that does not fit stays at the end of the line instead of starting the next one.
+          const blank = /^\s+$/.test(part);
+          if (!cjk && !blank && lineWidth && lineWidth + w > availableWidth + 0.0001) {
             if (!flush(false)) return { lines, consumed, overset: true };
             if (!prepare()) return { lines, consumed, overset: true };
           }
-          if (w > availableWidth + 0.0001 && !cjk) return { lines, consumed, overset: true };
+          if (w > availableWidth + 0.0001 && !cjk && !blank) return { lines, consumed, overset: true };
           segments.push({ text: part, x: lineWidth, width: w, style: runStyle });
           lineWidth += w; offset += part.length;
           height = Math.max(height, runStyle.fontSizePt * PT * leading);

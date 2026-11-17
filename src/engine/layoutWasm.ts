@@ -1,5 +1,6 @@
 import type { KnuthItem } from './knuthPlass';
 import { getRasterWasm, loadRasterWasm } from './rasterWasm';
+import { BREAKABLE_TOKENS } from './globalTypography';
 
 export async function loadLayoutKernels() {
   const engine = await loadRasterWasm();
@@ -48,7 +49,7 @@ function nativeUniformLines(text: string, measure: (text: string) => number, wid
   const engine = getRasterWasm();
   if (!engine?.layout_uniform_lines || text.length > 8192 || text.includes('\n') || !widths.length || widths.length > 128 ||
       !widths.every(width => Number.isFinite(width) && width > 1)) return undefined;
-  const words = text.match(/[^\S\n]+|[^\s]+/gu) || [];
+  const words = text.match(BREAKABLE_TOKENS) || [];
   if (words.length < 16 || words.length > 4096) return undefined;
   const advances = words.map(measure);
   const input = new DataView(engine.memory.buffer, engine.raster_input());

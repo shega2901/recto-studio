@@ -81,12 +81,13 @@ describe('paragraph styles while editing', () => {
   it('follows the words of a justified line', () => {
     const justified = [style('body', { alignment: 'justify' })];
     const { lines } = compose(story(['aa bb cccccc']), {}, justified);
-    // "aa bb " leaves four millimetres, shared by the two spaces of the first line.
+    // "aa bb" leaves five millimetres for its one inner space; the space after "bb" hangs past the
+    // margin, so "bb" ends flush with the right edge.
     expect(lines[0].chunks.map(chunk => [chunk.text, chunk.start, chunk.x])).toEqual([
-      ['aa', 0, 0], [' ', 2, 2], ['bb', 3, 5], [' ', 5, 7],
+      ['aa', 0, 0], [' ', 2, 2], ['bb', 3, 8], [' ', 5, 10],
     ]);
-    expect(caretAt(lines, 3, 'start', measure)!.x).toBe(5);
-    expect(offsetAtPoint(lines, frame, 5.2, 1, measure)).toEqual({ offset: 3, affinity: 'start' });
+    expect(caretAt(lines, 3, 'start', measure)!.x).toBe(8);
+    expect(offsetAtPoint(lines, frame, 8.2, 1, measure)).toEqual({ offset: 3, affinity: 'start' });
   });
 
   it('does not count a hyphen the composer added as a character', () => {
