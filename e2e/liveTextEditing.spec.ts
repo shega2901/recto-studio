@@ -274,3 +274,95 @@ test('reflows threaded frames while typing and lets the caret cross between them
   expect(Math.abs(endCommitted.x - endTyping.x)).toBeLessThan(1);
   expect(Math.abs(endCommitted.y - endTyping.y)).toBeLessThan(1);
 });
+
+test('formats the selection with keyboard shortcuts and keeps editing', async ({ page }) => {
+  await openStyledProject(page);
+  const point = await bodyLine(page);
+  await page.mouse.dblclick(point.x, point.y);
+  const editor = page.locator('.canvas-inline-editor');
+  await expect(editor).toBeFocused();
+  await page.mouse.dblclick(point.x, point.y);
+  const word = await selection(page);
+  expect(word.text.length).toBeGreaterThan(2);
+  const formats = () => page.evaluate(([id, text]) => {
+    const runs = (window as any).recto.stateManager.getStoryContent(id).paragraphs.flatMap((paragraph: { runs: unknown[] }) => paragraph.runs);
+    const run = runs.find((item: { text: string }) => item.text === text);
+    return run ? { bold: !!run.bold, italic: !!run.italic } : null;
+  }, [FRAME, word.text] as const);
+
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect.poll(formats).toEqual({ bold: true, italic: false });
+  // The shortcut is a physical key: on a Russian layout the same key types another letter.
+  await editor.evaluate((element, apple) => element.dispatchEvent(new KeyboardEvent('keydown',
+    { key: 'ш', code: 'KeyI', ctrlKey: !apple, metaKey: apple, bubbles: true, cancelable: true })), process.platform === 'darwin');
+  await expect.poll(formats).toEqual({ bold: true, italic: true });
+  await page.keyboard.press('ControlOrMeta+b');
+  await expect.poll(formats).toEqual({ bold: false, italic: true });
+
+  // Still editing, with the same word selected and its paragraph style untouched.
+  await expect(editor).toBeFocused();
+  expect(await selection(page)).toEqual(word);
+  expect((await frameState(page)).styles).toEqual(['ps-head', 'ps-body', 'ps-quote']);
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.type('!');
+  await page.keyboard.press('Control+Enter');
+  expect((await frameState(page)).text).toContain(`${word.text}!`);
+});
+
+test('scrolls to the caret and follows the story onto the next spread', async ({ page }) => {
+  const project = styledProject();
+  const [first] = project.spreads[0].elements;
+  const { storyContent: _story, ...frame } = first;
+  // The story starts in a small frame and continues in a frame on a second spread.
+  const linked = { ...project, spreads: [
+    { ...project.spreads[0], elements: [{ ...first, height: 24, nextFrameId: 'text-next' }] },
+    { id: 'spread-next', spreadIndex: 1, pages: [{ id: 'page-next', pageNumber: 2, side: 'single' }],
+      elements: [{ ...frame, id: 'text-next', pageId: 'page-next', prevFrameId: FRAME }] },
+  ] };
+  await page.route(/fonts\.(googleapis|gstatic)\.com/, route => route.abort());
+  await page.goto('/');
+  await importProject(page, linked as unknown as ReturnType<typeof projectFixture>);
+
+  const view = () => page.evaluate(() => {
+    const { stateManager, spreadCanvas } = (window as any).recto;
+    const state = stateManager.getState();
+    const canvas = document.querySelector('#spread-canvas')!.getBoundingClientRect();
+    const box = spreadCanvas.getLiveTextCaret();
+    return { spread: state.activeSpreadIndex as number, frame: state.selectedElementId as string,
+      caretInView: !!box && box.x >= 0 && box.x <= canvas.width && box.y >= 0 && box.y + box.height <= canvas.height };
+  });
+  const story = () => page.evaluate(id => (window as any).recto.stateManager.getStoryContent(id).paragraphs
+    .map((paragraph: { runs: { text: string }[] }) => paragraph.runs.map(run => run.text).join('')).join('\n') as string, FRAME);
+  const shown = (await page.evaluate(id => (window as any).recto.stateManager.getElementById(id).text as string, FRAME)).length;
+  expect(shown).toBeGreaterThan(HEADING.length + 20);
+  expect(shown).toBeLessThan(`${HEADING}\n${BODY}`.length);
+
+  const point = await framePoint(page, 60, 17);
+  await page.mouse.dblclick(point.x, point.y);
+  const editor = page.locator('.canvas-inline-editor');
+  await expect(editor).toBeFocused();
+
+  // The wheel moves the page under the editor; typing brings the caret back.
+  await page.mouse.wheel(0, 900);
+  await expect.poll(async () => (await view()).caretInView).toBe(false);
+  await page.keyboard.press('Home');
+  await expect.poll(async () => (await view()).caretInView).toBe(true);
+
+  // Past the last character this spread shows, the story continues on the next one.
+  await page.keyboard.press('Control+End');
+  expect((await selection(page)).start).toBe(shown);
+  await page.keyboard.press('ArrowRight');
+  await expect.poll(view).toEqual({ spread: 1, frame: 'text-next', caretInView: true });
+  await expect(page.locator('.canvas-inline-editor')).toBeFocused();
+  expect((await selection(page)).start).toBe(0);
+  await page.keyboard.type('NEXT ');
+
+  // And back: what was typed there stays in the story.
+  await page.keyboard.press('Control+Home');
+  await page.keyboard.press('ArrowLeft');
+  await expect.poll(view).toEqual({ spread: 0, frame: FRAME, caretInView: true });
+  await expect(page.locator('.canvas-inline-editor')).toBeFocused();
+  const expected = `${HEADING}\n${BODY}\n${QUOTE}`;
+  expect(await story()).toBe(`${expected.slice(0, shown)}NEXT ${expected.slice(shown)}`);
+  await page.keyboard.press('Escape');
+});

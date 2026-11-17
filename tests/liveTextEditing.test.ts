@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { layoutStory } from '../src/engine/storyLayout';
 import { editStory, sliceStory, storyText } from '../src/engine/storyContent';
-import { applyTextEdit, caretAt, indexLines, joinStory, locateCaret, neighbourLine, shiftLines, lineIndexAt, liveStoryContent, offsetAtPoint, paragraphRangeAt, replayEdits,
+import { applyTextEdit, caretAt, indexLines, joinStory, locateCaret, neighbourLine, rangeIsFormatted, shiftLines, lineIndexAt, liveStoryContent, offsetAtPoint, paragraphRangeAt, replayEdits,
   selectionRects, spliceStory, supportsLiveEditing, textEdit, verticalTarget, wordRangeAt } from '../src/engine/liveTextEditing';
 import type { ParagraphStyle, StoryContent, TextElement } from '../src/types';
 
@@ -358,6 +358,39 @@ describe('threaded frames edited together', () => {
     expect(joined.paragraphs[1].runs).toEqual([{ text: 'Start of a ' }, { text: 'bold', bold: true }]);
     // Nothing after the frames: the edited text is the whole flow.
     expect(joinStory(edited, { version: 1, paragraphs: [{ runs: [{ text: '' }] }] })).toEqual(edited);
+  });
+});
+
+describe('formatting shortcuts', () => {
+  const bold = [...styles, style('strong', { bold: true })];
+  const content: StoryContent = { version: 1, paragraphs: [
+    { styleId: 'strong', runs: [{ text: 'Title' }] },
+    { styleId: 'body', runs: [{ text: 'plain ' }, { text: 'bold', bold: true }, { text: ' tail' }] },
+    { styleId: 'strong', runs: [{ text: 'on ' }, { text: 'off', bold: false }] },
+  ] };
+  const isBold = (start: number, end: number) => rangeIsFormatted(content, start, end, 'bold', frame, bold);
+
+  it('counts formatting that comes from the paragraph style', () => {
+    expect(isBold(0, 5)).toBe(true);
+    expect(isBold(1, 3)).toBe(true);
+  });
+
+  it('needs every selected character to be formatted', () => {
+    expect(isBold(12, 16)).toBe(true);   // "bold"
+    expect(isBold(10, 16)).toBe(false);  // "n bold"
+    expect(isBold(12, 18)).toBe(false);  // "bold t"
+    expect(isBold(0, 16)).toBe(false);   // heading and body together
+  });
+
+  it('lets a run switch off what its paragraph style switches on', () => {
+    expect(isBold(22, 25)).toBe(true);   // "on "
+    expect(isBold(25, 28)).toBe(false);  // "off"
+    expect(isBold(22, 28)).toBe(false);
+  });
+
+  it('treats other kinds separately and an empty range as unformatted', () => {
+    expect(rangeIsFormatted(content, 12, 16, 'italic', frame, bold)).toBe(false);
+    expect(isBold(3, 3)).toBe(false);
   });
 });
 

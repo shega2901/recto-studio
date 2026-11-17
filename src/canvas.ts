@@ -39,10 +39,10 @@ import { assetStore } from './engine/assetStore';
 import { tableEngine } from './engine/tableEngine';
 import { tableThread } from './engine/tableCells';
 import { canvasRunFont, layoutStory } from './engine/storyLayout';
-import { indexLines, joinStory, liveStoryContent, shiftLines, spliceStory, supportsLiveEditing } from './engine/liveTextEditing';
+import { indexLines, joinStory, liveStoryContent, rangeIsFormatted, shiftLines, spliceStory, supportsLiveEditing } from './engine/liveTextEditing';
 import { plainStory, sliceStory } from './engine/storyContent';
-import { LiveTextEditor, liveTextEditingEnabled, setLiveTextEditingEnabled, type LivePart,
-  type LiveTextBase, type LiveTextBox, type LiveTextComposition, type LiveTextOpenOptions } from './engine/interaction/liveTextEditor';
+import { LiveTextEditor, liveTextEditingEnabled, setLiveTextEditingEnabled, type LivePart, type LiveTextBase, type LiveTextBox,
+  type LiveTextComposition, type LiveTextFormat, type LiveTextOpenOptions, type LiveTextReveal } from './engine/interaction/liveTextEditor';
 
 export { MM_TO_PX } from './engine/viewport';
 
@@ -1656,25 +1656,57 @@ export class SpreadCanvas {
   }
 
   public closeInlineTextEditor(commit: boolean = true): void {
-    if (!this.activeInlineEditor) return;
-    const { elementId, el, live } = this.activeInlineEditor;
-    const text = (el as HTMLTextAreaElement | HTMLInputElement).value;
-    // In-place editing may cover several threaded frames; the textarea editor always covers one.
-    const base = live ? this.liveTextBase(elementId) : null;
-    // Take the formatted draft before the editor goes away; it is what the canvas has been showing.
-    const draft = commit && base && base.text !== text ? live!.content() : null;
+    const active = this.activeInlineEditor;
+    if (!active) return;
+    const { elementId, el, live } = active;
+    if (live) {
+      // In-place editing may cover several threaded frames; its text goes back into their story.
+      try {
+        if (commit) this.commitLiveText();
+      } finally {
+        if (this.activeInlineEditor === active) this.activeInlineEditor = null;
+        live.destroy();
+        el.remove();
+        this.render();
+      }
+      return;
+    }
     this.activeInlineEditor = null;
-    live?.destroy();
+    const text = (el as HTMLTextAreaElement | HTMLInputElement).value;
     el.remove();
-    const currentEl = stateManager.getActiveSpread().elements.find((item) => item.id === elementId);
-    if (commit && currentEl?.type === 'text' && (base ? base.text : currentEl.text) !== text) {
-      if (!draft || !base?.range || !this.commitLiveStory(elementId, base.range, draft, text)) {
-        // Plain frames, and stories that refuse a content edit (a locked frame elsewhere in the thread).
-        if (!base || base.frames === 1) stateManager.updateElement(elementId, { text });
-        else alert('The text edit could not be saved to this story. Unlock its frames and try again.');
+    if (commit) {
+      const spread = stateManager.getActiveSpread();
+      const currentEl = spread.elements.find((item) => item.id === elementId);
+      if (currentEl && currentEl.type === 'text' && (currentEl as TextElement).text !== text) {
+        stateManager.updateElement(elementId, { text });
       }
     }
     this.render();
+  }
+
+  /**
+   * Store the in-place editor's pending text in the document and keep editing. Returns false when
+   * the document would not take it.
+   */
+  private commitLiveText(): boolean {
+    const active = this.activeInlineEditor;
+    const live = active?.live;
+    if (!active || !live) return false;
+    const id = active.elementId, text = live.value;
+    const base = this.liveTextBase(id);
+    if (!base) return false;
+    if (base.text === text) return true;
+    // The formatted draft is what the canvas has been showing; take it before the document changes.
+    const draft = live.content();
+    live.markCommitted();
+    if (draft && base.range && this.commitLiveStory(id, base.range, draft, text)) return true;
+    // Plain frames, and stories that refuse a content edit (a locked frame elsewhere in the thread).
+    if (base.frames === 1) {
+      stateManager.updateElement(id, { text });
+      return true;
+    }
+    alert('The text edit could not be saved to this story. Unlock its frames and try again.');
+    return false;
   }
 
   private openLiveTextEditor(textEl: TextElement, options: LiveTextOpenOptions): void {
@@ -1685,7 +1717,7 @@ export class SpreadCanvas {
       elementId: id, el: parent, selectionAtOpen: this.selectionKey(), threadEditable: this.storyChainEditable(textEl),
     };
     this.activeInlineEditor = active;
-    const live = new LiveTextEditor({
+    const live: LiveTextEditor = new LiveTextEditor({
       parent,
       base: () => this.liveTextBase(id),
       compose: (value, content) => this.composeLiveText(id, value, content),
@@ -1698,6 +1730,8 @@ export class SpreadCanvas {
         }
         this.closeInlineTextEditor(commit);
       },
+      follow: (offset, direction): boolean => this.activeInlineEditor?.live === live && this.followLiveCaret(offset, direction),
+      format: kind => { if (this.activeInlineEditor?.live === live) this.formatLiveText(kind); },
     }, id, textEl, this.canvas, options);
     active.el = live.textarea;
     active.live = live;
@@ -1780,7 +1814,7 @@ export class SpreadCanvas {
     const start = first.storyStart ?? 0;
     const range = { start, end: last.storyEnd ?? start + text.length };
     return {
-      key: [...run.map(item => item.textContent), start], text, range, frames: run.length,
+      key: [...run.map(item => item.textContent), start], text, range, start, frames: run.length,
       content: () => run.length === 1 ? frame.textContent! : sliceStory(stateManager.getStoryContent(id), range.start, range.end),
     };
   }
@@ -1861,6 +1895,79 @@ export class SpreadCanvas {
       active.tail = { key, content };
     }
     return active.tail.content;
+  }
+
+  /**
+   * Continue editing where the story goes on: a neighbouring frame of the thread that is not among
+   * the edited ones, usually on the next or previous spread. The pending text is committed first,
+   * as the frames on another spread can only be composed from the document.
+   */
+  private followLiveCaret(offset: number, direction: -1 | 1): boolean {
+    const active = this.activeInlineEditor;
+    const frame = active?.live && this.liveFrame(active.elementId);
+    const base = frame && this.liveTextBase(frame.id);
+    if (!active || !frame || !base?.range || !active.threadEditable) return false;
+    const run = this.liveRun(frame);
+    const neighbourId = direction < 0 ? run[0].prevFrameId : run[run.length - 1].nextFrameId;
+    const state = stateManager.getState();
+    const spreadOf = (id: string) => state.spreads.findIndex(spread => spread.elements.some(element => element.id === id));
+    if (!neighbourId || spreadOf(neighbourId) === -1 || stateManager.getElementById(neighbourId)?.type !== 'text') return false;
+    const storyOffset = base.range.start + offset;
+    this.closeInlineTextEditor(true);
+    // The story has reflowed; walk on while the caret lies beyond the frame, as after a long paste.
+    let target = stateManager.getElementById(neighbourId) as TextElement;
+    const seen = new Set<string>();
+    while (direction > 0 && target.nextFrameId && storyOffset > (target.storyEnd ?? Infinity) && !seen.has(target.id)) {
+      seen.add(target.id);
+      const next = stateManager.getElementById(target.nextFrameId);
+      if (next?.type !== 'text' || spreadOf(next.id) === -1) break;
+      target = next;
+    }
+    const spreadIndex = spreadOf(target.id);
+    if (spreadIndex !== stateManager.getState().activeSpreadIndex) stateManager.setActiveSpread(spreadIndex);
+    stateManager.selectElement(target.id);
+    // Going back, the caret belongs at the end of the previous frame's last line, not on a line after it.
+    this.openInlineTextEditor(target.id, { storyOffset, affinity: direction < 0 ? 'end' : 'start' });
+    return true;
+  }
+
+  /** Ctrl+B and friends: toggle character formatting on the selected text of the in-place editor. */
+  private formatLiveText(kind: LiveTextFormat): void {
+    const active = this.activeInlineEditor;
+    const live = active?.live;
+    if (!active || !live) return;
+    const { start, end } = live.selection;
+    const id = active.elementId;
+    const story = this.liveTextBase(id)?.range?.start ?? 0;
+    // Formatting is a document command on the story, so the typing before it has to be in the document.
+    if (end <= start || !this.commitLiveText()) return;
+    const frame = this.liveFrame(id);
+    if (!frame) return;
+    const state = stateManager.getState();
+    const formatted = rangeIsFormatted(stateManager.getStoryContent(id), story + start, story + end, kind, frame, state.paragraphStyles, state.characterStyles);
+    try {
+      stateManager.formatStoryRange(id, story + start, story + end, { [kind]: !formatted });
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not format the selected text.');
+    }
+  }
+
+  /** Bring the caret into view after it moved by typing or the keyboard. */
+  private applyLiveReveal(live: LiveTextEditor, reveal: LiveTextReveal): void {
+    if (this.activeInlineEditor?.live !== live) return;
+    if ('beyond' in reveal) {
+      this.followLiveCaret(reveal.beyond, 1);
+      return;
+    }
+    const rect = this.canvas.getBoundingClientRect();
+    const margin = 28;
+    const { x, y, height } = reveal.caret;
+    const dx = x < margin ? margin - x : x > rect.width - margin ? rect.width - margin - x : 0;
+    const dy = y < margin ? margin - y : y + height > rect.height - margin ? rect.height - margin - (y + height) : 0;
+    if (dx || dy) {
+      const state = stateManager.getState();
+      stateManager.setPan(state.panX + dx, state.panY + dy);
+    }
   }
 
   /** Ids of the frames the in-place editor is showing. */
@@ -3980,7 +4087,9 @@ export class SpreadCanvas {
       }
     }
     // Every edited frame had its turn; hide the caret if none of them holds it.
-    liveEditor?.finishPaint();
+    const reveal = liveEditor?.finishPaint();
+    // Scrolling or changing spread redraws; do that once this paint is over.
+    if (liveEditor && reveal) queueMicrotask(() => this.applyLiveReveal(liveEditor, reveal));
     if (state.previewMode) {
       ctx.restore();
     }

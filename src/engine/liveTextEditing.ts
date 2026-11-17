@@ -111,6 +111,29 @@ export function joinStory(first: StoryContent, rest: StoryContent): StoryContent
   return { version: 1, paragraphs: [...first.paragraphs.slice(0, -1), joined, ...rest.paragraphs.slice(1)] };
 }
 
+/**
+ * Whether every character in the range already shows the formatting, counting what its paragraph
+ * and character styles give it. Decides if a shortcut such as Ctrl+B switches it on or off.
+ */
+export function rangeIsFormatted(content: StoryContent, start: number, end: number, kind: 'bold' | 'italic' | 'underline',
+  frame: TextElement, styles: ParagraphStyle[], characters: CharacterStyle[] = []): boolean {
+  let offset = 0, touched = false;
+  if (end <= start) return false;
+  for (const paragraph of content.paragraphs) {
+    if (offset >= end) break;
+    const style = resolveParagraphStyle(paragraph, styles);
+    for (const run of paragraph.runs) {
+      const from = offset;
+      offset += run.text.length;
+      if (offset <= start || from >= end || !run.text) continue;
+      if (!resolveRunStyle(frame, style, run, characters)[kind]) return false;
+      touched = true;
+    }
+    offset++;
+  }
+  return touched;
+}
+
 /** One contiguous replacement, as a single input event makes. */
 export interface TextEdit { start: number; removed: number; inserted: string }
 

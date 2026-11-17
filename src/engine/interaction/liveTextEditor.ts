@@ -53,7 +53,17 @@ export interface LiveTextBase {
   text: string;
   /** Its formatted content, or null for a plain frame. Only asked for when `key` changes. */
   content(): StoryContent | null;
+  /** Where the text begins in its story, when it is part of one. */
+  start?: number;
 }
+
+export type LiveTextFormat = 'bold' | 'italic' | 'underline';
+
+/**
+ * What the canvas should bring into view after a paint: the caret, or, when the caret has moved
+ * past everything the edited frames show, the offset it is at so the view can follow the story.
+ */
+export type LiveTextReveal = { caret: { x: number; y: number; height: number } } | { beyond: number };
 
 /** Frame position on the canvas, in CSS pixels from the canvas corner. */
 export interface LiveTextBox { x: number; y: number; pxPerMm: number }
@@ -68,6 +78,13 @@ export interface LiveTextHost {
   requestRender(): void;
   /** `toUi` is set when focus moved to a control outside the canvas. */
   close(commit: boolean, toUi?: boolean): void;
+  /**
+   * The caret is leaving the edited frames at `offset`, towards the start (-1) or the end (1) of
+   * the story. Returns true when the story continues elsewhere and editing moved there.
+   */
+  follow(offset: number, direction: -1 | 1): boolean;
+  /** Toggle character formatting on the selection. */
+  format(kind: LiveTextFormat): void;
 }
 
 export interface LiveTextOpenOptions {
@@ -75,6 +92,9 @@ export interface LiveTextOpenOptions {
   selection?: { start: number; end: number };
   /** Put the caret under this pointer position (client coordinates). */
   point?: { clientX: number; clientY: number };
+  /** Put the caret at this offset of the story, as when editing follows the text to another spread. */
+  storyOffset?: number;
+  affinity?: CaretAffinity;
 }
 
 type DragMode = 'character' | 'word' | 'paragraph';
@@ -100,6 +120,8 @@ export class LiveTextEditor {
   private compositionStart: number | null = null;
   private caretKey = '';
   private caretPainted = false;
+  /** The caret moved by typing or the keyboard since the last paint, so the view should show it. */
+  private reveal = false;
   private closed = false;
 
   constructor(private readonly host: LiveTextHost, public readonly elementId: string, frame: TextElement,
@@ -126,6 +148,7 @@ export class LiveTextEditor {
       this.recordEdit();
       this.affinity = 'start';
       this.goalX = null;
+      this.reveal = true;
       this.known = { start: textarea.selectionStart, end: textarea.selectionEnd };
       this.host.requestRender();
     }, listen);
@@ -145,8 +168,11 @@ export class LiveTextEditor {
     textarea.focus({ preventScroll: true });
 
     const length = textarea.value.length;
-    if (options.selection) {
-      this.select(Math.min(options.selection.start, length), Math.min(options.selection.end, length));
+    if (options.storyOffset !== undefined) {
+      const offset = Math.max(0, Math.min(options.storyOffset - (host.base()?.start ?? 0), length));
+      this.select(offset, offset, options.affinity, true);
+    } else if (options.selection) {
+      this.select(Math.min(options.selection.start, length), Math.min(options.selection.end, length), 'start', true);
     } else if (options.point) {
       const bounds = canvas.getBoundingClientRect();
       const hit = this.hit(options.point.clientX - bounds.left, options.point.clientY - bounds.top);
@@ -169,11 +195,12 @@ export class LiveTextEditor {
     return this.textarea.selectionDirection === 'backward' ? this.textarea.selectionEnd : this.textarea.selectionStart;
   }
 
-  private select(anchor: number, focus: number, affinity: CaretAffinity = 'start') {
+  private select(anchor: number, focus: number, affinity: CaretAffinity = 'start', reveal = false) {
     const start = Math.min(anchor, focus), end = Math.max(anchor, focus);
     this.textarea.setSelectionRange(start, end, focus < anchor ? 'backward' : 'forward');
     this.known = { start, end };
     this.affinity = affinity;
+    if (reveal) this.reveal = true;
     this.host.requestRender();
   }
 
@@ -184,7 +211,15 @@ export class LiveTextEditor {
     this.known = { start, end };
     this.affinity = 'start';
     this.goalX = null;
+    this.reveal = true;
     this.host.requestRender();
+  }
+
+  /** The pending text is being stored in the document: from here on it is the committed text. */
+  public markCommitted() {
+    this.committedText = this.lastValue = this.textarea.value;
+    this.edits = [];
+    this.draft = null;
   }
 
   /** Each input event is one contiguous change; fold it into the formatted draft straight away. */
@@ -327,11 +362,29 @@ export class LiveTextEditor {
     }
   }
 
-  /** After every edited frame was painted: no frame showed the caret (a range, no focus, overset text). */
-  public finishPaint() {
-    if (this.caretPainted) return;
-    this.caret.style.display = 'none';
-    this.caretKey = '';
+  /**
+   * After every edited frame was painted. Hides the caret when no frame showed it (a range, no
+   * focus, overset text) and reports what the view should follow, once per caret movement.
+   */
+  public finishPaint(): LiveTextReveal | null {
+    if (!this.caretPainted) {
+      this.caret.style.display = 'none';
+      this.caretKey = '';
+    }
+    if (!this.reveal) return null;
+    this.reveal = false;
+    const { start, end } = this.selection;
+    if (start !== end || document.activeElement !== this.textarea) return null;
+    if (this.caretPainted) return { caret: this.caretBox()! };
+    const shown = this.shownEnd();
+    return shown !== null && start >= shown ? { beyond: start } : null;
+  }
+
+  /** Offset just past the last character the edited frames show, or null when they show no lines. */
+  private shownEnd(): number | null {
+    let shown: number | null = null;
+    for (const part of this.composed?.result.parts || []) for (const line of part.live) shown = Math.max(shown ?? 0, line.next);
+    return shown;
   }
 
   /** Where the caret is drawn, in canvas CSS pixels. For tests and tooling. */
@@ -355,6 +408,23 @@ export class LiveTextEditor {
     }
     const apple = /Mac|iPhone|iPad/.test(navigator.platform);
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+    // By physical key, so the shortcuts work on any keyboard layout.
+    const format = ({ KeyB: 'bold', KeyI: 'italic', KeyU: 'underline' } as Record<string, LiveTextFormat>)[event.code];
+    if (format && (apple ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      this.host.format(format);
+      return;
+    }
+    const { selectionStart, selectionEnd } = this.textarea;
+    if (plain && !event.shiftKey && selectionStart === selectionEnd) {
+      // At either end of the edited frames the story may go on, on another spread.
+      const leaving = (event.key === 'ArrowLeft' || event.key === 'Backspace') && selectionStart === 0 ? -1
+        : event.key === 'ArrowRight' && selectionStart === this.textarea.value.length && selectionStart === (this.shownEnd() ?? -1) ? 1 : 0;
+      if (leaving && this.host.follow(selectionStart, leaving)) {
+        event.preventDefault();
+        return;
+      }
+    }
     let handled = false;
     // The textarea wraps its own text differently from the page, so anything line-based is ours.
     if (plain && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
@@ -382,13 +452,15 @@ export class LiveTextEditor {
     const lines = parts[located.part].live;
     while (page && lines[target.line + direction]?.column === lines[located.position.line].column) target.line += direction;
     if (target.line === located.position.line) target = neighbourLine(parts, located.part, located.position.line, direction);
+    // No line further that way here: the story may continue on another spread.
+    if (!target && !extend && this.host.follow(direction < 0 ? 0 : this.shownEnd() ?? length, direction)) return true;
     let hit: Hit = { offset: direction < 0 ? 0 : length, affinity: 'start' };
     if (target) {
       const box = this.host.box(parts[target.part].frame);
       hit = lineOffsetAt(parts[target.part].live[target.line], (goal - box.x) / box.pxPerMm);
       if (hit.offset > length) hit = { offset: length, affinity: 'start' };
     }
-    this.select(extend ? this.anchorOffset : hit.offset, hit.offset, hit.affinity);
+    this.select(extend ? this.anchorOffset : hit.offset, hit.offset, hit.affinity, true);
     this.goalX = goal;
     return true;
   }
@@ -400,7 +472,7 @@ export class LiveTextEditor {
     const line = parts[located.part].live[located.position.line];
     const offset = Math.min(end ? line.end : line.start, this.textarea.value.length);
     this.goalX = null;
-    this.select(extend ? this.anchorOffset : offset, offset, end && !line.hard ? 'end' : 'start');
+    this.select(extend ? this.anchorOffset : offset, offset, end && !line.hard ? 'end' : 'start', true);
     return true;
   }
 
