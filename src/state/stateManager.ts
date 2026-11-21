@@ -69,7 +69,6 @@ import { parseProject } from './projectValidation';
 import { fontManager } from '../fontManager';
 import { parseMergeData, generateMergedSpreads, substituteElementTokens } from '../dataMerge';
 import { KnuthPlassComposer, ComposerOptions } from '../engine/knuthPlass';
-import { psdEngine } from '../engine/psdParser';
 import { colorEngine, GamutAuditResult, IccProfileName } from '../engine/colorEngine';
 
 // Preserve imports used by existing exporters, UI components, and integrations.
@@ -1976,7 +1975,8 @@ export class StateManager {
     const isCurrent = () => this.getElementById(elementId) === el && this.pendingImageReplacements.get(el) === request;
     if (typeof data !== 'string' && !(data instanceof ArrayBuffer) && /\.ps[db]$/i.test(data.name)) {
       if (data.size > 64 * 1024 * 1024) throw new Error('Choose an image smaller than 64 MB.');
-      const buffer = await data.arrayBuffer();
+      // Fetch the PSD reader while the file is read, so the load below does not wait for a download.
+      const [buffer] = await Promise.all([data.arrayBuffer(), import('../engine/psdParser')]);
       return isCurrent() && this.loadPsdForElement(elementId, buffer, data.name);
     }
     const { readPlacedImage } = await import('../engine/placedImage');
@@ -3820,13 +3820,18 @@ export class StateManager {
 
   /**
    * Loads a binary Adobe Photoshop PSD buffer into an ImageElement without flattening.
+   * The PSD reader is loaded on demand: it is large and only needed when a PSD is placed.
    */
-  public loadPsdForElement(elementId: string, psdBuffer: ArrayBuffer | Uint8Array, fileName?: string): boolean {
-    const el = this.getElementById(elementId);
-    if (!el || el.type !== 'image' || el.locked || this.state.layers.find(layer => layer.id === el.layerId)?.locked) return false;
-    const img = el as ImageElement;
-
+  public async loadPsdForElement(elementId: string, psdBuffer: ArrayBuffer | Uint8Array, fileName?: string): Promise<boolean> {
+    const editable = () => {
+      const el = this.getElementById(elementId);
+      return el && el.type === 'image' && !el.locked && !this.state.layers.find(layer => layer.id === el.layerId)?.locked ? el : null;
+    };
+    if (!editable()) return false;
+    const { psdEngine } = await import('../engine/psdParser');
     const psdData = psdEngine.parse(psdBuffer);
+    const img = editable() as ImageElement | null;
+    if (!img) return false;
     this.pendingImageReplacements.delete(img);
     delete img.assetId;
     delete img.proxySrc;
