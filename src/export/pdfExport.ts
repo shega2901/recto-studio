@@ -4,6 +4,8 @@ import { publicationPreflight } from '../engine/publicationPreflight';
 import { embeddedAsset, prepareExportAssets } from './publicationAssets';
 import { registerPdfFonts, usedPdfFonts } from './pdfFonts';
 import { warmLayout } from '../engine/layoutRuntime';
+import { documentHyphenationLanguages } from '../engine/documentLanguages';
+import { loadHyphenation } from '../engine/languageHyphenation';
 /**
  * Recto Studio — High-Precision Desktop Publishing Engine
  * Copyright (c) 2022-2026 Abhinav. All rights reserved.
@@ -74,7 +76,9 @@ export async function exportDocumentToPdf(
   if (options.accessibility && options.accessibility !== 'pdfua1') throw new Error('Only PDF/UA-1 (PDF 1.7) output is supported. PDF/UA-2 requires a separate PDF 2.0 pipeline.');
   if (options.accessibility && options.spreadRange && options.spreadRange !== 'all') throw new Error('Accessible PDF currently exports the whole publication so linked tables and story structure remain complete.');
   if (options.transparency === 'flatten' && (options.tagged || options.accessibility)) throw new Error('Use separate tagged screen and flattened print exports; a flattened print PDF is not an accessible screen edition.');
-  await Promise.all([warmLayout(), fontManager.restoreFonts(source.embeddedFonts)]);
+  // Hyphenation dictionaries that load on demand must be present before the publication is composed.
+  await Promise.all([warmLayout(), fontManager.restoreFonts(source.embeddedFonts),
+    ...[...documentHyphenationLanguages(source)].map(loadHyphenation)]);
   const measure = pdfStoryMeasure();
   const state = publicationSnapshot(await prepareExportAssets(source, options.fetchExternalAssets ?? typeof window !== 'undefined', false, true,
     options.visualProof ? warning => options.onWarning?.(warning) : undefined), measure);

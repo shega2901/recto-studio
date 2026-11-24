@@ -1,6 +1,8 @@
 import type { CanvasElement, FontAsset, ProjectState, StoryContent, TextElement } from '../types';
 import { fontManager } from '../fontManager';
 import { warmLayout } from './layoutRuntime';
+import { documentHyphenationLanguages } from './documentLanguages';
+import { loadHyphenation } from './languageHyphenation';
 import { reflowStoryState, storyHeads, type StoryLayoutState } from './publicationReferences';
 import { publicationWrapObjects } from './publicationWrap';
 import { measureStoryText, resolveParagraphStyle, resolveRunStyle, type RunStyle } from './storyLayout';
@@ -146,7 +148,9 @@ export function fontMeasurementsMatch({ probes, samples }: Pick<StoryComposition
 }
 
 export async function composeStoryInBackground(request: StoryCompositionRequest): Promise<StoryComposition | null> {
-  await Promise.all([warmLayout(), fontManager.restoreFonts(request.fonts)]);
+  // The worker has its own copy of the hyphenation dictionaries: load the ones the story needs first.
+  await Promise.all([warmLayout(), fontManager.restoreFonts(request.fonts),
+    ...[...documentHyphenationLanguages(request.layout)].map(loadHyphenation)]);
   if (!fontMeasurementsMatch(request)) return null;
   const frames = request.layout.spreads.flatMap(spread => spread.elements);
   const head = frames.find(frame => frame.id === request.headId);

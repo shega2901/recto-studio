@@ -145,7 +145,7 @@ export function StylesTab({ state }: StylesTabProps) {
                   </select></label>
                   <label>Hyphenation language<select aria-label="Hyphenation language" value={style.language || 'en-US'}
                     onChange={event => stateManager.updateParagraphStyle(style.id, { language: event.currentTarget.value as ParagraphStyle['language'] })}>
-                      <option value="en-US">English (US)</option><option value="de">German</option><option value="fr">French</option>
+                      <option value="en-US">English (US)</option><option value="de">German</option><option value="fr">French</option><option value="ru">Russian</option>
                       <option value="ja">Japanese (no dictionary hyphenation)</option><option value="zh">Chinese (no dictionary hyphenation)</option><option value="ko">Korean (no dictionary hyphenation)</option>
                   </select></label>
                     <label className="publication-check"><input type="checkbox" checked={!!style.cjkLineBreak} onChange={event => stateManager.updateParagraphStyle(style.id, { cjkLineBreak: event.currentTarget.checked })}/>Horizontal CJK punctuation rules</label>

@@ -20,7 +20,8 @@ initially. Gzip figures are calculated locally, not observed network transfer;
 actual compression depends on the hosting server.
 
 PDF, EPUB, flipbook, IDML export, document packaging, booklet imposition, cover
-design, InDesign import, and manuscript import load through dynamic imports.
+design, InDesign import, manuscript import, and the Russian hyphenation
+dictionary load through dynamic imports.
 The duplicate HTML jsPDF script is no longer loaded. Table rendering shares
 lightweight PDF color helpers without importing the PDF generator. Existing
 PDF helper exports remain available for callers.

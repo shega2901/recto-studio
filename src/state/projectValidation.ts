@@ -105,7 +105,7 @@ const paragraphStyle = object({
   grepStyles: optional(array(grepRule)),
   keepWithNext: optional(boolean), keepTogether: optional(boolean),
   orphanLines: optional(count), widowLines: optional(count),
-  hyphenate: optional(boolean), language: optional(choice('en-US', 'de', 'fr', 'ja', 'zh', 'ko')), cjkLineBreak: optional(boolean),
+  hyphenate: optional(boolean), language: optional(choice('en-US', 'de', 'fr', 'ru', 'ja', 'zh', 'ko')), cjkLineBreak: optional(boolean),
   bold: optional(boolean), italic: optional(boolean),
 });
 const textFormatting = {
@@ -119,7 +119,7 @@ const storyShape = object({
     language: optional(text),
     formatting: optional(object({
       ...textFormatting, alignment: optional(alignment), lineHeight: optional(positive), letterSpacingPt: optional(number),
-      language: optional(choice('en-US', 'de', 'fr', 'ja', 'zh', 'ko')), cjkLineBreak: optional(boolean), hyphenate: optional(boolean),
+      language: optional(choice('en-US', 'de', 'fr', 'ru', 'ja', 'zh', 'ko')), cjkLineBreak: optional(boolean), hyphenate: optional(boolean),
       widowLines: optional(count), orphanLines: optional(count), keepTogether: optional(boolean), keepWithNext: optional(boolean),
     })),
     runs: array(object({

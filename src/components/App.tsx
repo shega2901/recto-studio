@@ -4,6 +4,8 @@ import type { IngestedStory } from '../contentImport';
 import type { TextElement, ImageElement } from '../types';
 import { storyText } from '../engine/storyContent';
 import { documentUsesFontFamilies, visitDocumentFonts } from '../engine/documentFonts';
+import { documentHyphenationLanguages } from '../engine/documentLanguages';
+import { loadHyphenation, onHyphenationLoaded } from '../engine/languageHyphenation';
 import { useProjectState } from '../hooks/useProjectState';
 import { TopBar } from './TopBar';
 import { Toolbar } from './Toolbar';
@@ -88,6 +90,10 @@ export function App() {
     stateManager.refreshLayoutForFonts(families);
     spreadCanvasRef.current?.render();
   }), []);
+  // A hyphenation dictionary that loads on demand changes where the stories using it break.
+  useEffect(() => onHyphenationLoaded(language => {
+    if (stateManager.refreshLayoutForHyphenation(language)) spreadCanvasRef.current?.render();
+  }), []);
   const documentSession = stateManager.getDocumentSession();
   useEffect(() => {
     const families = new Set<string>();
@@ -95,6 +101,7 @@ export function App() {
     families.forEach(family => {
       if (fontManager.isGoogleFont(family)) void fontManager.loadGoogleFont(family);
     });
+    for (const language of documentHyphenationLanguages(stateManager.getState())) void loadHyphenation(language);
   }, [documentSession]);
 
   useEffect(() => {

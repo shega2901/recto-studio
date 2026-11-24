@@ -50,6 +50,7 @@ import { calculateTacPercentage, runEditorPreflight } from '../engine/editorPref
 import { instantiateMasterItem, resolveMaster } from '../engine/masterInheritance';
 import { arrangeSelection, lockedArtworkIds, restorePlacedPasteboard, selectionUnits } from '../engine/selectionGeometry';
 import { elementUsesFont, primaryFont, storyHeadsUsingFontFamilies, visitDocumentFonts } from '../engine/documentFonts';
+import { storyHeadsHyphenatedIn } from '../engine/documentLanguages';
 import { prepareSpreadTemplate } from '../engine/spreadTemplate';
 import { validateBinding, type DataRefreshChange } from '../engine/dataRefresh';
 import { contentOf, indexStoryReflow, insertRun, layoutFrameNotes, migrateLegacyNotes, noteMarker, notesForFrame, publicationHeadings, reflowStoryFrames, reflowStoryState, refreshPublication, storyHeads, textFrames, type StoryReflowRange } from '../engine/publicationReferences';
@@ -3649,6 +3650,20 @@ export class StateManager {
     migrateLegacyNotes(this.state);
     refreshPublication(this.state);
     this.reflowFormattedStories();
+  }
+
+  /** A hyphenation dictionary arrived: compose again the stories it hyphenates. Returns whether any changed. */
+  public refreshLayoutForHyphenation(language: string): boolean {
+    const heads = storyHeadsHyphenatedIn(this.state, language);
+    // Plain frames are composed when drawn, so a style using the language only needs a repaint.
+    if (!heads.length) return this.state.paragraphStyles.some(style => style.hyphenate && style.language === language);
+    if (this.state.settings.footnotes?.length || storyHeads(this.state).some(head => head.autoExtendStory)) {
+      this.refreshPublicationReferences(false);
+      return true;
+    }
+    for (const head of heads) this.reflowStory(head.id);
+    this.refreshPublicationReferences(false, undefined, true);
+    return true;
   }
 
   public refreshLayoutForFonts(families: readonly string[]) {

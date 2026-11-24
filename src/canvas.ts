@@ -40,6 +40,7 @@ import { tableEngine } from './engine/tableEngine';
 import { createTableThreadLookup } from './engine/tableCells';
 import { createContentTableLayoutLookup } from './engine/tableLayout';
 import { canvasRunFont, layoutStory } from './engine/storyLayout';
+import { hyphenationGeneration } from './engine/languageHyphenation';
 import { fontManager } from './fontManager';
 import { layoutKernels } from './engine/layoutRuntime';
 
@@ -2645,7 +2646,7 @@ export class SpreadCanvas {
 
   public render(proof?: { context: CanvasRenderingContext2D; spot?: string }) {
     if (!proof) this.overflownTextFrameIds.clear();
-    const revision = `${stateManager.getDocumentRevision()}:${fontManager.generation}`;
+    const revision = `${stateManager.getDocumentRevision()}:${fontManager.generation}:${hyphenationGeneration()}`;
     if (revision !== this.formattedLayoutRevision || layoutKernels !== this.formattedLayoutKernels) {
       this.formattedLayouts.clear();
       this.clearDragTextBitmaps();

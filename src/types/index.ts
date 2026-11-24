@@ -141,7 +141,7 @@ export interface ParagraphStyle {
   orphanLines?: number;
   widowLines?: number;
   hyphenate?: boolean;
-  language?: 'en-US' | 'de' | 'fr' | 'ja' | 'zh' | 'ko';
+  language?: 'en-US' | 'de' | 'fr' | 'ru' | 'ja' | 'zh' | 'ko';
   cjkLineBreak?: boolean;
   bold?: boolean;
   italic?: boolean;

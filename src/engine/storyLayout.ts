@@ -85,7 +85,7 @@ export function resolveParagraphStyle(paragraph: StoryParagraph, styles: Paragra
   if (paragraph.language) {
     const language = paragraph.language.toLowerCase();
     const primary = language.split('-')[0];
-    const supported = (['de', 'fr', 'ja', 'zh', 'ko'] as const).find(item => item === primary);
+    const supported = (['de', 'fr', 'ru', 'ja', 'zh', 'ko'] as const).find(item => item === primary);
     style.language = supported || (language === 'en-us' ? 'en-US' : undefined);
   }
   return style;
