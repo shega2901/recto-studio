@@ -91,6 +91,17 @@ function inDesignAlignment(value: string): 'left' | 'center' | 'right' | 'justif
   return undefined;
 }
 
+/**
+ * InDesign's language names ("$ID/Russian", "$ID/English: USA", "$ID/German: 2006 Reform") as the
+ * hyphenation languages Recto has. English variants use the US dictionary, the only English one.
+ */
+export function inDesignLanguage(value: string): ParagraphStyle['language'] | undefined {
+  const name = value.replace(/^\$ID\//, '').trim().toLowerCase();
+  const languages = [['english', 'en-US'], ['german', 'de'], ['french', 'fr'], ['russian', 'ru'],
+    ['japanese', 'ja'], ['chinese', 'zh'], ['korean', 'ko']] as const;
+  return languages.find(([prefix]) => name.startsWith(prefix))?.[1];
+}
+
 const OBJECT_APPEARANCE = ['FillColor', 'FillTint', 'StrokeColor', 'StrokeWeight', 'StrokeTint'] as const;
 
 /** Stroke and fill of each object style, with what it inherits from the style it is based on. */
@@ -140,7 +151,7 @@ function resolveParagraphStyleProperties(xml: string) {
     const id = property('Self') || `#anonymous-${index}`;
     const properties: Record<string, string> = {};
     for (const key of ['AppliedFont', 'PointSize', 'Leading', 'AutoLeading', 'Justification', 'FillColor', 'FillTint', 'DropCapLines',
-      'FontStyle', 'GridAlignment', 'Tracking']) {
+      'FontStyle', 'GridAlignment', 'Tracking', 'AppliedLanguage', 'Hyphenation']) {
       const value = property(key);
       if (value) properties[key] = value;
     }
@@ -765,6 +776,10 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
       };
       if (/bold|black|heavy|semibold|demi/i.test(fontStyle)) style.bold = true;
       if (/italic|oblique/i.test(fontStyle)) style.italic = true;
+      // Hyphenation and its language, as the style (or the one it is based on) sets them.
+      const language = inDesignLanguage(properties.AppliedLanguage ?? '');
+      if (language) style.language = language;
+      if (properties.Hyphenation === 'true' || properties.Hyphenation === 'false') style.hyphenate = properties.Hyphenation === 'true';
       parsedStyles.push(style);
       styleRefs.set(id, style);
     }
@@ -825,6 +840,8 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
         const cRanges = extractXmlTags(pr, 'CharacterStyleRange');
         const paraTokens: string[] = [];
         const richRuns: StoryRun[] = [];
+        // InDesign often sets the language on the text rather than the paragraph; count it per character.
+        const languageCounts = new Map<string, number>();
 
         for (const cr of cRanges) {
           const ptSize = parseFloat(extractXmlAttr(cr, 'PointSize') || '');
@@ -880,6 +897,8 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
             }
           }
 
+          const rangeLanguage = inDesignLanguage(extractXmlAttr(cr, 'AppliedLanguage') || '');
+          if (rangeLanguage) languageCounts.set(rangeLanguage, (languageCounts.get(rangeLanguage) ?? 0) + rangeTokens.join('').length);
           const fontStyle = (extractXmlAttr(cr, 'FontStyle') || '').toLowerCase();
           richRuns.push({ text: decodeStoryXml(rangeTokens.join('')),
             ...(fontStyle ? { bold: fontStyle.includes('bold'), italic: fontStyle.includes('italic') || fontStyle.includes('oblique') } : {}),
@@ -905,13 +924,18 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
           const last = richRuns.findLast(run => run.text.length);
           if (last?.text.endsWith('\n')) last.text = last.text.slice(0, -1);
         }
+        // The paragraph's language: set on the paragraph, or the one most of its text is in.
+        // Read from the range's own tag: the attribute also appears on the character ranges inside it.
+        const paragraphLanguage = inDesignLanguage(extractXmlAttr(pr.slice(0, pr.indexOf('>') + 1), 'AppliedLanguage') || '')
+          ?? [...languageCounts].sort((a, b) => b[1] - a[1])[0]?.[0];
+        const own = { ...local, ...(paragraphLanguage && paragraphLanguage !== paragraphStyle?.language ? { language: paragraphLanguage } : {}) };
         // Preserve hard breaks as structured paragraph boundaries with the same run formatting.
         let currentRuns: StoryRun[] = [];
         for (const run of richRuns) run.text.split('\n').forEach((text, index) => {
-          if (index) { richParagraphs.push({ styleId: paragraphStyle?.id, ...local, runs: currentRuns.length ? currentRuns : [{ text: '' }] }); currentRuns = []; }
+          if (index) { richParagraphs.push({ styleId: paragraphStyle?.id, ...own, runs: currentRuns.length ? currentRuns : [{ text: '' }] }); currentRuns = []; }
           currentRuns.push({ ...run, text });
         });
-        richParagraphs.push({ styleId: paragraphStyle?.id, ...local, runs: currentRuns.length ? currentRuns : [{ text: '' }] });
+        richParagraphs.push({ styleId: paragraphStyle?.id, ...own, runs: currentRuns.length ? currentRuns : [{ text: '' }] });
         if (paraStr.length > 0) {
           paragraphs.push(paraStr);
         }

@@ -5,6 +5,8 @@ import { hyphenateLanguage, hyphenationGeneration, loadHyphenation, onHyphenatio
 import { documentHyphenationLanguages, storyHeadsHyphenatedIn } from '../src/engine/documentLanguages';
 import { layoutStory } from '../src/engine/storyLayout';
 import { plainStory, storyText } from '../src/engine/storyContent';
+import { inDesignLanguage, parseIdmlPackage } from '../src/idmlImport';
+import { createZipArchive } from '../src/zip';
 import type { ParagraphStyle, ProjectState, TextElement } from '../src/types';
 
 const measure = (text: string, style: { fontSizePt: number }) => Array.from(text).length * style.fontSizePt * 0.5 * 25.4 / 72;
@@ -89,5 +91,57 @@ describe('Russian hyphenation', () => {
     expect([...documentHyphenationLanguages(state)]).toEqual(['ru']);
     expect(storyHeadsHyphenatedIn(state, 'ru').map(head => head.id)).toEqual(['a']);
     expect(storyHeadsHyphenatedIn(state, 'de')).toEqual([]);
+  });
+});
+
+describe('InDesign language on import', () => {
+  it('maps InDesign language names to the dictionaries Recto has', () => {
+    expect(inDesignLanguage('$ID/Russian')).toBe('ru');
+    expect(inDesignLanguage('$ID/English: USA')).toBe('en-US');
+    expect(inDesignLanguage('$ID/English: UK')).toBe('en-US');
+    expect(inDesignLanguage('$ID/German: 2006 Reform')).toBe('de');
+    expect(inDesignLanguage('$ID/French: Canadian')).toBe('fr');
+    expect(inDesignLanguage('$ID/[No Language]')).toBeUndefined();
+    expect(inDesignLanguage('$ID/Ukrainian')).toBeUndefined();
+  });
+
+  it('imports the language and hyphenation of styles and paragraphs', async () => {
+    const styles = `<Styles><RootParagraphStyleGroup>
+      <ParagraphStyle Self="ParagraphStyle/$ID/[No paragraph style]" Name="$ID/[No paragraph style]" PointSize="12"
+        AppliedLanguage="$ID/Russian" Hyphenation="true"/>
+      <ParagraphStyle Self="ParagraphStyle/Text" Name="Text"><Properties><BasedOn type="string">$ID/[No paragraph style]</BasedOn></Properties></ParagraphStyle>
+      <ParagraphStyle Self="ParagraphStyle/Title" Name="Title" Hyphenation="false"><Properties><BasedOn type="string">$ID/[No paragraph style]</BasedOn></Properties></ParagraphStyle>
+      <ParagraphStyle Self="ParagraphStyle/English" Name="English" AppliedLanguage="$ID/English: USA"><Properties><BasedOn type="string">Text</BasedOn></Properties></ParagraphStyle>
+    </RootParagraphStyleGroup></Styles>`;
+    const range = (style: string, ranges: string, local = '') =>
+      `<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/${style}"${local}>${ranges}<Br/></ParagraphStyleRange>`;
+    const characters = (text: string, language = '') =>
+      `<CharacterStyleRange${language ? ` AppliedLanguage="${language}"` : ''}><Content>${text}</Content></CharacterStyleRange>`;
+    const idml = createZipArchive({
+      'designmap.xml': '<Document><idPkg:Spread src="Spreads/Spread_one.xml"/></Document>',
+      'Resources/Styles.xml': styles,
+      'Resources/Preferences.xml': '<Preferences><DocumentPreference PageHeight="623.62" PageWidth="453.54" FacingPages="false"/></Preferences>',
+      'Spreads/Spread_one.xml': `<Spread Self="one"><Page Self="p" GeometricBounds="0 0 623.62 453.54" ItemTransform="1 0 0 1 0 -311.81"/>
+        <TextFrame Self="text" ParentStory="story" ItemTransform="1 0 0 1 0 -311.81"><Properties><PathGeometry><GeometryPathType PathOpen="false"><PathPointArray>
+          <PathPointType Anchor="40 60" LeftDirection="40 60" RightDirection="40 60"/><PathPointType Anchor="40 560" LeftDirection="40 560" RightDirection="40 560"/>
+          <PathPointType Anchor="400 560" LeftDirection="400 560" RightDirection="400 560"/><PathPointType Anchor="400 60" LeftDirection="400 60" RightDirection="400 60"/>
+        </PathPointArray></GeometryPathType></PathGeometry></Properties></TextFrame></Spread>`,
+      'Stories/Story_story.xml': `<Story Self="story">${
+        range('Text', characters('Русский абзац')) +
+        // An English quotation pasted into Russian text: most of the paragraph is English.
+        range('Text', characters('«', '$ID/Russian') + characters('The quick brown fox jumps', '$ID/English: USA') + characters('»', '$ID/Russian')) +
+        range('Text', characters('Silbentrennung'), ' AppliedLanguage="$ID/German: 2006 Reform"') +
+        range('English', characters('English text'))
+      }</Story>`,
+    });
+    const project = await parseIdmlPackage(idml, 'languages.idml');
+    const named = (name: string) => project.paragraphStyles.find(style => style.name === name)!;
+    expect(named('Text')).toMatchObject({ language: 'ru', hyphenate: true });
+    expect(named('Title')).toMatchObject({ language: 'ru', hyphenate: false });
+    expect(named('English')).toMatchObject({ language: 'en-US', hyphenate: true });
+
+    const text = project.spreads.flatMap(spread => spread.elements).find(element => element.type === 'text') as TextElement;
+    const paragraphs = text.storyContent!.paragraphs;
+    expect(paragraphs.map(paragraph => paragraph.language)).toEqual([undefined, 'en-US', 'de', undefined]);
   });
 });
