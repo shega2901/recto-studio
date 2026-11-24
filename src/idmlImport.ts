@@ -6,6 +6,7 @@ import {
   ImageElement,
   ShapeElement,
   ParagraphStyle,
+  CharacterStyle,
   MasterSpread,
   DocumentSettings,
   CanvasElement,
@@ -133,14 +134,18 @@ function withObjectStyleAppearance(xml: string, styles: Map<string, Record<strin
   });
 }
 
-function resolveParagraphStyleProperties(xml: string) {
-  const definitions = extractXmlTags(xml, 'ParagraphStyle').map((tag, index) => {
+const PARAGRAPH_STYLE_PROPERTIES = ['AppliedFont', 'PointSize', 'Leading', 'AutoLeading', 'Justification', 'FillColor', 'FillTint',
+  'DropCapLines', 'FontStyle', 'GridAlignment', 'Tracking'];
+const CHARACTER_STYLE_PROPERTIES = ['AppliedFont', 'PointSize', 'FillColor', 'FillTint', 'FontStyle', 'Underline'];
+
+/** Styles of one kind with the properties they set themselves or inherit through BasedOn. */
+function resolveStyleProperties(xml: string, kind: 'ParagraphStyle' | 'CharacterStyle', keys: readonly string[]) {
+  const definitions = extractXmlTags(xml, kind).map((tag, index) => {
     const header = tag.slice(0, tag.indexOf('>') + 1);
     const property = (name: string) => styleProperty(tag, header, name);
     const id = property('Self') || `#anonymous-${index}`;
     const properties: Record<string, string> = {};
-    for (const key of ['AppliedFont', 'PointSize', 'Leading', 'AutoLeading', 'Justification', 'FillColor', 'FillTint', 'DropCapLines',
-      'FontStyle', 'GridAlignment', 'Tracking']) {
+    for (const key of keys) {
       const value = property(key);
       if (value) properties[key] = value;
     }
@@ -150,8 +155,8 @@ function resolveParagraphStyleProperties(xml: string) {
   // InDesign writes BasedOn for its built-in styles without the type prefix their Self carries
   // ("$ID/[No paragraph style]" against "ParagraphStyle/$ID/[No paragraph style]").
   for (const definition of definitions) {
-    if (definition.parentId && !byId.has(definition.parentId) && byId.has(`ParagraphStyle/${definition.parentId}`)) {
-      definition.parentId = `ParagraphStyle/${definition.parentId}`;
+    if (definition.parentId && !byId.has(definition.parentId) && byId.has(`${kind}/${definition.parentId}`)) {
+      definition.parentId = `${kind}/${definition.parentId}`;
     }
   }
   const resolved = new Map<string, Record<string, string>>();
@@ -178,6 +183,8 @@ function resolveParagraphStyleProperties(xml: string) {
   }
   return definitions.map(({ id, name }) => ({ id, name, properties: resolved.get(id)! }));
 }
+
+const resolveParagraphStyleProperties = (xml: string) => resolveStyleProperties(xml, 'ParagraphStyle', PARAGRAPH_STYLE_PROPERTIES);
 
 export interface PageSpreadBox {
   id: string;
@@ -770,6 +777,38 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     }
   }
 
+  // Character styles, so text set in one keeps its colour and face.
+  const characterStyles: CharacterStyle[] = [];
+  const characterRefs = new Map<string, CharacterStyle>();
+  if (stylesFile) {
+    const usedIds = new Set<string>();
+    const definitions = resolveStyleProperties(textDecoder.decode(stylesFile), 'CharacterStyle', CHARACTER_STYLE_PROPERTIES);
+    for (const { id, name: idmlName, properties } of definitions) {
+      // [No character style] and InDesign's other built-ins are not styles text keeps.
+      if (!idmlName || idmlName.startsWith('$ID')) continue;
+      const name = idmlName.trim();
+      const baseId = `idml-character-${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
+      let styleId = baseId;
+      for (let suffix = 2; usedIds.has(styleId); suffix++) styleId = `${baseId}-${suffix}`;
+      usedIds.add(styleId);
+      const style: CharacterStyle = { id: styleId, name };
+      const tint = parseFloat(properties.FillTint ?? '');
+      const color = properties.FillColor ? resolveIdmlColor(properties.FillColor, Number.isFinite(tint) ? tint : undefined, colorsMap) : undefined;
+      if (color && color !== 'transparent') style.color = color;
+      // A character style that names a font style sets both: "Regular" turns bold and italic off.
+      if (properties.FontStyle) {
+        style.bold = /bold|black|heavy|semibold|demi/i.test(properties.FontStyle);
+        style.italic = /italic|oblique/i.test(properties.FontStyle);
+      }
+      const size = parseFloat(properties.PointSize ?? '');
+      if (Number.isFinite(size) && size > 0) style.fontSizePt = size;
+      if (properties.AppliedFont) style.fontFamily = properties.AppliedFont;
+      if (properties.Underline === 'true' || properties.Underline === 'false') style.underline = properties.Underline === 'true';
+      characterStyles.push(style);
+      characterRefs.set(id, style);
+    }
+  }
+
   // Frames and lines take the stroke and fill their object style gives them unless they override it.
   const objectStyles = stylesFile ? resolveObjectStyleAppearance(textDecoder.decode(stylesFile)) : new Map<string, Record<string, string>>();
 
@@ -880,8 +919,13 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
             }
           }
 
+          const appliedCharacter = decodeStoryXml(extractXmlAttr(cr.slice(0, cr.indexOf('>') + 1), 'AppliedCharacterStyle') || '').trim();
+          const characterStyle = appliedCharacter ? characterRefs.get(appliedCharacter) ?? characterStyles.find(style =>
+            style.name.toLowerCase() === appliedCharacter.replace('CharacterStyle/', '').trim().toLowerCase()) : undefined;
           const fontStyle = (extractXmlAttr(cr, 'FontStyle') || '').toLowerCase();
           richRuns.push({ text: decodeStoryXml(rangeTokens.join('')),
+            // Attributes on the range itself come after, so they override the style, as in InDesign.
+            ...(characterStyle ? { characterStyleId: characterStyle.id } : {}),
             ...(fontStyle ? { bold: fontStyle.includes('bold'), italic: fontStyle.includes('italic') || fontStyle.includes('oblique') } : {}),
             ...(extractXmlAttr(cr, 'Underline') ? { underline: extractXmlAttr(cr, 'Underline') === 'true' } : {}),
             ...(appliedFont ? { fontFamily: decodeStoryXml(appliedFont.trim()) } : {}),
@@ -1475,6 +1519,7 @@ export async function parseIdmlPackage(idmlBuffer: ArrayBuffer | Uint8Array, fil
     snapToGuides: true,
     displayQuality: 'typical',
     paragraphStyles: parsedStyles,
+    characterStyles,
     masterSpreads: masterSpreads.length ? masterSpreads : DEFAULT_MASTER_SPREADS,
     linkingFromFrameId: null,
     layers,
