@@ -1521,12 +1521,18 @@ export class SpreadCanvas {
    * Caret / selection in the inline text editor of `elementId`, as offsets into the editor's text.
    * Falls back to the selection remembered when the editor just lost focus to the UI.
    * Returns null when that frame is not being edited, so callers apply to the whole frame.
+   * When the frame is edited in place, `paragraphs` are the styles of the paragraphs of the text as
+   * typed so far: the document keeps the old text until the edit is committed, so after a Return the
+   * paragraphs of the text and those of the document no longer line up.
    */
-  public getActiveTextSelection(elementId: string): { text: string; start: number; end: number } | null {
+  public getActiveTextSelection(elementId: string): { text: string; start: number; end: number; paragraphs?: { styleId?: string }[] } | null {
     if (this.activeInlineEditor && this.activeInlineEditor.elementId === elementId) {
       const ta = this.activeInlineEditor.el as HTMLTextAreaElement;
       if (typeof ta.selectionStart !== 'number' || typeof ta.selectionEnd !== 'number') return null;
-      return { text: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
+      const frame = this.activeInlineEditor.live ? stateManager.getActiveSpread().elements.find(item => item.id === elementId) : undefined;
+      const draft = frame?.type === 'text' ? this.activeInlineEditor.live!.content(frame) : null;
+      return { text: ta.value, start: ta.selectionStart, end: ta.selectionEnd,
+        ...(draft ? { paragraphs: draft.paragraphs.map(paragraph => ({ styleId: paragraph.styleId })) } : {}) };
     }
     const remembered = this.rememberedTextSelection;
     if (remembered && remembered.elementId === elementId) {
